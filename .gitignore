@@ -1,0 +1,9 @@
+# build output
+/stash
+/dist/
+
+# runtime state — never commit the database or unseal keys
+/data/
+*.db
+*.key
+unseal-key*
