@@ -306,13 +306,48 @@ $("#identity-form").addEventListener("submit", async (e) => {
   }
 });
 
+// ---------- audit (admin only) ----------
+
+async function loadAudit() {
+  const r = await authFetch("/v1/audit?limit=50");
+  if (!r.ok) {
+    $("#audit-card").hidden = true;
+    return;
+  }
+  const data = await r.json();
+  $("#audit-card").hidden = false;
+  const badge = $("#audit-status");
+  badge.textContent =
+    (data.verified ? "chain intact ✓" : "chain BROKEN ✗") + " · " + (data.count || 0) + " entries";
+  badge.className = "badge " + (data.verified ? "ok" : "warn");
+
+  const body = tbody("#audit");
+  body.innerHTML = "";
+  (data.entries || []).forEach((e) => {
+    const t = (e.time || "").replace("T", " ").replace(/\.\d+/, "").replace("Z", "");
+    const rcls = e.result === "ok" ? "ok" : e.result === "denied" || e.result === "error" ? "err" : "muted";
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td class="muted">${esc(t)}</td>` +
+      `<td>${esc(e.identity)}</td>` +
+      `<td>${esc(e.action)}</td>` +
+      `<td class="path">${esc(e.path)}</td>` +
+      `<td class="${rcls}">${esc(e.result)}</td>`;
+    body.appendChild(tr);
+  });
+}
+
 // ---------- boot ----------
 
 function refresh() {
   loadStatus();
   loadSecrets();
   loadIdentities();
+  loadAudit();
 }
 
 refresh();
-setInterval(loadStatus, 4000);
+setInterval(() => {
+  loadStatus();
+  loadAudit();
+}, 4000);

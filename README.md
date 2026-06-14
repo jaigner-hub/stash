@@ -5,9 +5,9 @@ secret storage that is genuinely *easy* to stand up — no external database, no
 Redis, no Kubernetes. One Go binary that does it all, replicating state with
 embedded Raft.
 
-> **Status: milestone 5 — identity & access.** This is a hobby project and is
-> **not production-ready**. Do not trust it with real secrets yet. (For the
-> keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
+> **Status: milestone 6 — audit log.** This is a hobby project and is **not
+> production-ready**. Do not trust it with real secrets yet. (For the keygrip
+> dev pair, SOPS stays authoritative until this is battle-tested.)
 
 ## Why
 
@@ -146,6 +146,19 @@ curl -H "Authorization: Bearer $ROOT" -X POST $API/v1/identities \
 # -> {"name":"ci","token":"stash-…"}   (shown once)
 ```
 
+## Audit log
+
+Every secret read/write/delete/list and identity change is recorded in a
+per-node, append-only, **hash-chained** audit log (each entry embeds the prior
+entry's hash, so any edit/insert/delete is detectable). Denied attempts are
+logged too, with the identity, action, path, and result.
+
+It's intentionally **per-node** — each node logs the operations it actually
+served (reads are served locally, so only a per-node log captures them) — and
+lives in its own `audit.db`, separate from the replicated store. View it at
+`GET /v1/audit` (admin) or in the console's Audit panel, which shows recent
+entries and a chain-integrity indicator.
+
 ## Web console
 
 Open `http://<node>:8200/` in a browser. The console is a dependency-free
@@ -176,6 +189,7 @@ internal/ui/assets/{index.html,style.css,app.js}  →  go:embed  →  served at 
 | `GET`    | `/v1/identities`     | — | `{"identities":[…]}` (admin) |
 | `POST`   | `/v1/identities`     | `{"name","admin","policies":[…]}` | `{"name","token"}` (admin) |
 | `DELETE` | `/v1/identities/{name}` | — | `204` (admin) |
+| `GET`    | `/v1/audit?limit=N`  | — | `{"entries":[…],"verified":bool,"count":N}` (admin) |
 | `GET`    | `/` and `/app.js`, `/style.css` | — | embedded web console |
 
 All `/v1/secret*`, `/v1/secrets`, `/v1/cluster/status`, and `/v1/identities`
@@ -194,10 +208,10 @@ and each later milestone now *feeds* it (audit view, history/diff, login).
 - [x] **M3 — easy join**: one-token pairing, auto address-detection, secret-gated join, restart from `cluster.json`.
 - [x] **M4 — Web UI v1**: embedded console (dependency-free, tailnet-gated) — view/add/edit/delete secrets, cluster health.
 - [x] **M5 — identity & access**: bearer-token identities (hashed at rest) + path-prefix ACLs; root token; UI login + Identities panel; open-mode for upgrades.
-- [ ] **M6 — audit**: hash-chained append-only audit log (reads + writes) → Loki; UI gains an audit view.
+- [x] **M6 — audit**: per-node hash-chained append-only audit log (reads, writes, denials, identity changes); admin API + UI panel with chain-integrity check.
 - [ ] **M7 — versioning**: keep last N versions per path; UI gains history/diff.
 - [ ] **M8 — agent**: `stash agent` renders secrets → tmpfs with last-good cache (reboot-during-outage self-heal).
-- [ ] follow-ups: join-secret rotation (`stash token rotate`), inter-node mTLS (CA fingerprint in token), Tailscale auto-discovery.
+- [ ] follow-ups: join-secret rotation (`stash token rotate`), inter-node mTLS (CA fingerprint in token), Tailscale auto-discovery, ship audit log to Loki.
 
 ## Security notes (read before trusting it)
 

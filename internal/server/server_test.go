@@ -128,7 +128,7 @@ func do(t *testing.T, h http.Handler, method, target string, body []byte) *httpt
 }
 
 func TestPutGetDeleteRoundTrip(t *testing.T) {
-	h := New(newFake(), nil)
+	h := New(newFake(), nil, nil)
 	body, _ := json.Marshal(secretBody{Value: "hunter2"})
 
 	if rec := do(t, h, "PUT", "/v1/secret/kg/web/PW", body); rec.Code != http.StatusNoContent {
@@ -156,21 +156,21 @@ func TestPutGetDeleteRoundTrip(t *testing.T) {
 }
 
 func TestGetMissing(t *testing.T) {
-	h := New(newFake(), nil)
+	h := New(newFake(), nil, nil)
 	if rec := do(t, h, "GET", "/v1/secret/nope", nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("got %d", rec.Code)
 	}
 }
 
 func TestPutInvalidJSON(t *testing.T) {
-	h := New(newFake(), nil)
+	h := New(newFake(), nil, nil)
 	if rec := do(t, h, "PUT", "/v1/secret/x", []byte("not json")); rec.Code != http.StatusBadRequest {
 		t.Fatalf("got %d", rec.Code)
 	}
 }
 
 func TestList(t *testing.T) {
-	h := New(newFake(), nil)
+	h := New(newFake(), nil, nil)
 	for _, p := range []string{"a", "b"} {
 		body, _ := json.Marshal(secretBody{Value: "v"})
 		do(t, h, "PUT", "/v1/secret/"+p, body)
@@ -191,7 +191,7 @@ func TestList(t *testing.T) {
 }
 
 func TestHealth(t *testing.T) {
-	h := New(newFake(), nil)
+	h := New(newFake(), nil, nil)
 	rec := do(t, h, "GET", "/v1/health", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d", rec.Code)
@@ -202,14 +202,14 @@ func TestHealth(t *testing.T) {
 func TestWriteForwardsToLeader(t *testing.T) {
 	// Stand up a "leader" HTTP server that records the forwarded write.
 	leader := newFake()
-	leaderSrv := httptest.NewServer(New(leader, nil))
+	leaderSrv := httptest.NewServer(New(leader, nil, nil))
 	defer leaderSrv.Close()
 
 	// Follower: not leader, points at the leader's URL.
 	follower := newFake()
 	follower.leader = false
 	follower.leaderURL = leaderSrv.URL
-	h := New(follower, nil)
+	h := New(follower, nil, nil)
 
 	body, _ := json.Marshal(secretBody{Value: "forwarded"})
 	rec := do(t, h, "PUT", "/v1/secret/foo", body)
@@ -228,7 +228,7 @@ func TestWriteForwardsToLeader(t *testing.T) {
 func TestWriteNoLeader(t *testing.T) {
 	follower := newFake()
 	follower.leader = false // no leaderURL set => unknown
-	h := New(follower, nil)
+	h := New(follower, nil, nil)
 	body, _ := json.Marshal(secretBody{Value: "x"})
 	if rec := do(t, h, "PUT", "/v1/secret/foo", body); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("got %d", rec.Code)
@@ -237,7 +237,7 @@ func TestWriteNoLeader(t *testing.T) {
 
 func TestJoin(t *testing.T) {
 	b := newFake()
-	h := New(b, nil)
+	h := New(b, nil, nil)
 	body, _ := json.Marshal(map[string]string{
 		"node_id": "n2", "raft_addr": "127.0.0.1:8301", "http_addr": "http://127.0.0.1:8201",
 		"secret": "good-secret",
@@ -252,7 +252,7 @@ func TestJoin(t *testing.T) {
 
 func TestJoinWrongSecret(t *testing.T) {
 	b := newFake()
-	h := New(b, nil)
+	h := New(b, nil, nil)
 	body, _ := json.Marshal(map[string]string{
 		"node_id": "n2", "raft_addr": "127.0.0.1:8301", "secret": "WRONG",
 	})

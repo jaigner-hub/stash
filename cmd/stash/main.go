@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jaigner-hub/stash/internal/audit"
 	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/crypto"
 	"github.com/jaigner-hub/stash/internal/server"
@@ -199,7 +200,13 @@ func cmdServer(args []string) error {
 		printJoinToken(cfg.HTTPAddr, id, secret, kek)
 	}
 
-	return serve(node, listenAddr, kek, log)
+	aud, err := audit.Open(filepath.Join(*dir, "audit.db"), cfg.NodeID)
+	if err != nil {
+		return err
+	}
+	defer aud.Close()
+
+	return serve(node, aud, listenAddr, kek, log)
 }
 
 func cmdJoin(args []string) error {
@@ -289,7 +296,13 @@ func cmdJoin(args []string) error {
 	}
 	log.Info("joined cluster", "leader", token.LeaderAPI, "node", id, "addr", raftAdv)
 
-	return serve(node, *listen, kek, log)
+	aud, err := audit.Open(filepath.Join(*dir, "audit.db"), id)
+	if err != nil {
+		return err
+	}
+	defer aud.Close()
+
+	return serve(node, aud, *listen, kek, log)
 }
 
 func cmdToken(args []string) error {
@@ -328,7 +341,7 @@ func cmdToken(args []string) error {
 }
 
 // serve runs the HTTP API and a background unsealer until interrupted.
-func serve(node *cluster.Node, listen string, kek []byte, log *slog.Logger) error {
+func serve(node *cluster.Node, auditor server.Auditor, listen string, kek []byte, log *slog.Logger) error {
 	if kek != nil {
 		go func() {
 			if err := node.Unseal(kek, 60*time.Second); err != nil {
@@ -343,7 +356,7 @@ func serve(node *cluster.Node, listen string, kek []byte, log *slog.Logger) erro
 
 	httpSrv := &http.Server{
 		Addr:         listen,
-		Handler:      server.New(node, log),
+		Handler:      server.New(node, auditor, log),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}

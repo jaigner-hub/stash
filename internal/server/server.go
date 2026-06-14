@@ -11,12 +11,22 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 
+	"github.com/jaigner-hub/stash/internal/audit"
 	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/store"
 	"github.com/jaigner-hub/stash/internal/ui"
 )
+
+// Auditor records and reports the tamper-evident audit log. *audit.Log
+// implements it; pass nil to disable auditing (e.g. in tests).
+type Auditor interface {
+	Record(identity, action, path, result string) error
+	Recent(n int) ([]audit.Entry, error)
+	Verify() (bool, uint64, error)
+}
 
 const maxBodyBytes = 1 << 20 // 1 MiB — secrets are small; cap abuse.
 
@@ -42,15 +52,17 @@ type Backend interface {
 
 type server struct {
 	backend Backend
+	audit   Auditor
 	log     *slog.Logger
 }
 
-// New returns an http.Handler serving the stash API backed by b.
-func New(b Backend, log *slog.Logger) http.Handler {
+// New returns an http.Handler serving the stash API backed by b. auditor may be
+// nil to disable audit logging.
+func New(b Backend, auditor Auditor, log *slog.Logger) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
-	srv := &server{backend: b, log: log}
+	srv := &server{backend: b, audit: auditor, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", srv.health)
 	mux.HandleFunc("GET /v1/secrets", srv.list)
@@ -62,9 +74,25 @@ func New(b Backend, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /v1/identities", srv.listIdentities)
 	mux.HandleFunc("POST /v1/identities", srv.createIdentity)
 	mux.HandleFunc("DELETE /v1/identities/{name}", srv.deleteIdentity)
+	mux.HandleFunc("GET /v1/audit", srv.auditLog)
 	// Embedded web console at / (most specific /v1/... routes win over this).
 	mux.Handle("/", ui.Handler())
 	return mux
+}
+
+// record appends an audit entry, attributing it to id (if known). Best-effort:
+// a failed record is logged, not surfaced to the caller.
+func (s *server) record(id *cluster.Identity, action, path, result string) {
+	if s.audit == nil {
+		return
+	}
+	name := "unknown"
+	if id != nil {
+		name = id.Name
+	}
+	if err := s.audit.Record(name, action, path, result); err != nil {
+		s.log.Error("audit record failed", "err", err)
+	}
 }
 
 // auth resolves the request's identity. In "open mode" (no identities exist
@@ -126,14 +154,21 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.PathValue("path")
 	if !id.Can(cluster.CapRead, path) {
+		s.record(id, "read", path, "denied")
 		forbid(w)
 		return
 	}
 	v, err := s.backend.Get(path)
 	if err != nil {
+		result := "error"
+		if errors.Is(err, store.ErrNotFound) {
+			result = "not_found"
+		}
+		s.record(id, "read", path, result)
 		s.writeErr(w, err)
 		return
 	}
+	s.record(id, "read", path, "ok")
 	writeJSON(w, http.StatusOK, secretBody{Value: string(v)})
 }
 
@@ -142,12 +177,14 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !id.Can(cluster.CapWrite, r.PathValue("path")) {
+	path := r.PathValue("path")
+	if !id.Can(cluster.CapWrite, path) {
+		s.record(id, "write", path, "denied")
 		forbid(w)
 		return
 	}
 	if !s.backend.IsLeader() {
-		s.proxyToLeader(w, r)
+		s.proxyToLeader(w, r) // the leader records the actual write
 		return
 	}
 	defer r.Body.Close()
@@ -161,10 +198,12 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 		return
 	}
-	if err := s.backend.Put(r.PathValue("path"), []byte(body.Value)); err != nil {
+	if err := s.backend.Put(path, []byte(body.Value)); err != nil {
+		s.record(id, "write", path, "error")
 		s.writeErr(w, err)
 		return
 	}
+	s.record(id, "write", path, "ok")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -173,18 +212,26 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !id.Can(cluster.CapDelete, r.PathValue("path")) {
+	path := r.PathValue("path")
+	if !id.Can(cluster.CapDelete, path) {
+		s.record(id, "delete", path, "denied")
 		forbid(w)
 		return
 	}
 	if !s.backend.IsLeader() {
-		s.proxyToLeader(w, r)
+		s.proxyToLeader(w, r) // the leader records the actual delete
 		return
 	}
-	if err := s.backend.Delete(r.PathValue("path")); err != nil {
+	if err := s.backend.Delete(path); err != nil {
+		result := "error"
+		if errors.Is(err, store.ErrNotFound) {
+			result = "not_found"
+		}
+		s.record(id, "delete", path, result)
 		s.writeErr(w, err)
 		return
 	}
+	s.record(id, "delete", path, "ok")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -205,6 +252,7 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 			visible = append(visible, k)
 		}
 	}
+	s.record(id, "list", "", "ok")
 	writeJSON(w, http.StatusOK, map[string]any{"keys": visible})
 }
 
@@ -267,6 +315,7 @@ func (s *server) createIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !id.Admin {
+		s.record(id, "identity.create", "", "denied")
 		forbid(w)
 		return
 	}
@@ -290,9 +339,11 @@ func (s *server) createIdentity(w http.ResponseWriter, r *http.Request) {
 	}
 	token, err := s.backend.CreateIdentity(req.Name, req.Admin, req.Policies)
 	if err != nil {
+		s.record(id, "identity.create", req.Name, "error")
 		s.writeErr(w, err)
 		return
 	}
+	s.record(id, "identity.create", req.Name, "ok")
 	// The token is shown exactly once.
 	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name, "token": token})
 }
@@ -302,7 +353,9 @@ func (s *server) deleteIdentity(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	name := r.PathValue("name")
 	if !id.Admin {
+		s.record(id, "identity.delete", name, "denied")
 		forbid(w)
 		return
 	}
@@ -310,11 +363,49 @@ func (s *server) deleteIdentity(w http.ResponseWriter, r *http.Request) {
 		s.proxyToLeader(w, r)
 		return
 	}
-	if err := s.backend.DeleteIdentity(r.PathValue("name")); err != nil {
+	if err := s.backend.DeleteIdentity(name); err != nil {
+		result := "error"
+		if errors.Is(err, store.ErrNotFound) {
+			result = "not_found"
+		}
+		s.record(id, "identity.delete", name, result)
 		s.writeErr(w, err)
 		return
 	}
+	s.record(id, "identity.delete", name, "ok")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	if !id.Admin {
+		forbid(w)
+		return
+	}
+	if s.audit == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"entries": []audit.Entry{}, "verified": true, "count": 0})
+		return
+	}
+	limit := 100
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	entries, err := s.audit.Recent(limit)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	intact, count, err := s.audit.Verify()
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "verified": intact, "count": count})
 }
 
 // proxyToLeader reverse-proxies the current request to the leader's API.

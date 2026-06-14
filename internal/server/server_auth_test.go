@@ -39,7 +39,7 @@ func enforcedFake() *fakeBackend {
 }
 
 func TestAuthRequiredWhenEnforced(t *testing.T) {
-	h := New(enforcedFake(), nil)
+	h := New(enforcedFake(), nil, nil)
 	if rec := doTok(t, h, "GET", "/v1/secrets", "", nil); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("no token: want 401 got %d", rec.Code)
 	}
@@ -51,7 +51,7 @@ func TestAuthRequiredWhenEnforced(t *testing.T) {
 func TestCapEnforcement(t *testing.T) {
 	f := enforcedFake()
 	f.data["kg/web/A"] = []byte("x")
-	h := New(f, nil)
+	h := New(f, nil, nil)
 	body, _ := json.Marshal(secretBody{Value: "y"})
 
 	if rec := doTok(t, h, "GET", "/v1/secret/kg/web/A", "readtok", nil); rec.Code != http.StatusOK {
@@ -72,7 +72,7 @@ func TestListFiltersByCap(t *testing.T) {
 	f := enforcedFake()
 	f.data["kg/web/A"] = []byte("x")
 	f.data["other/B"] = []byte("y")
-	h := New(f, nil)
+	h := New(f, nil, nil)
 
 	rec := doTok(t, h, "GET", "/v1/secrets", "readtok", nil)
 	if rec.Code != http.StatusOK {
@@ -90,7 +90,7 @@ func TestListFiltersByCap(t *testing.T) {
 }
 
 func TestIdentityEndpointsAdminOnly(t *testing.T) {
-	h := New(enforcedFake(), nil)
+	h := New(enforcedFake(), nil, nil)
 	if rec := doTok(t, h, "GET", "/v1/identities", "readtok", nil); rec.Code != http.StatusForbidden {
 		t.Fatalf("non-admin: want 403 got %d", rec.Code)
 	}
@@ -113,7 +113,7 @@ func TestIdentityEndpointsAdminOnly(t *testing.T) {
 
 func TestOpenModeAllowsNoToken(t *testing.T) {
 	// No identities => open mode => requests succeed without a token.
-	h := New(newFake(), nil)
+	h := New(newFake(), nil, nil)
 	if rec := doTok(t, h, "GET", "/v1/secrets", "", nil); rec.Code != http.StatusOK {
 		t.Fatalf("open mode should allow: got %d", rec.Code)
 	}
