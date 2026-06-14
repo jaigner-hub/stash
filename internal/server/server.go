@@ -6,6 +6,7 @@ package server
 import (
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jaigner-hub/stash/internal/audit"
 	"github.com/jaigner-hub/stash/internal/cluster"
@@ -31,6 +33,7 @@ type Auditor interface {
 	Record(identity, action, path, result string) error
 	Page(before uint64, limit int) ([]audit.Entry, error)
 	Verify() (bool, uint64, error)
+	VerifyAnchors(roots *x509.CertPool) ([]audit.AnchorResult, error)
 }
 
 const maxBodyBytes = 1 << 20 // 1 MiB — secrets are small; cap abuse.
@@ -627,7 +630,53 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "verified": intact, "count": count})
+	resp := map[string]any{"entries": entries, "verified": intact, "count": count}
+	// Live trusted-timestamp verification: the server already holds the db open,
+	// so this is the way to check anchors on a running node (the CLI can't take
+	// the lock). Best-effort — a roots/verify hiccup must not fail the audit view.
+	if anchors := s.anchorSummary(); anchors != nil {
+		resp["anchors"] = anchors
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// anchorSummary verifies the stored TSA anchors against the system trust roots
+// (DigiCert's timestamping root lives there) and returns a compact summary, or
+// nil if anchors can't be evaluated. The newest verified anchor gives the
+// tightest "the log through seq N existed by T" upper bound.
+func (s *server) anchorSummary() map[string]any {
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil
+	}
+	results, err := s.audit.VerifyAnchors(roots)
+	if err != nil {
+		return nil
+	}
+	allOK := true
+	var provenSeq uint64
+	var provenBy string
+	failures := []map[string]any{}
+	for _, r := range results {
+		if r.OK {
+			if r.HeadSeq >= provenSeq {
+				provenSeq = r.HeadSeq
+				provenBy = r.Time.UTC().Format(time.RFC3339)
+			}
+			continue
+		}
+		allOK = false
+		failures = append(failures, map[string]any{"head_seq": r.HeadSeq, "err": r.Err})
+	}
+	sum := map[string]any{"count": len(results), "verified": allOK && len(results) > 0}
+	if provenBy != "" {
+		sum["proven_through_seq"] = provenSeq
+		sum["proven_by"] = provenBy
+	}
+	if len(failures) > 0 {
+		sum["failures"] = failures
+	}
+	return sum
 }
 
 // proxyToLeader reverse-proxies the current request to the leader's API.

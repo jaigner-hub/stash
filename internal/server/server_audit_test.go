@@ -1,11 +1,13 @@
 package server
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jaigner-hub/stash/internal/audit"
 )
@@ -13,6 +15,7 @@ import (
 type fakeAuditor struct {
 	mu      sync.Mutex
 	entries []audit.Entry
+	anchors []audit.AnchorResult // returned by VerifyAnchors
 }
 
 func (a *fakeAuditor) Record(identity, action, path, result string) error {
@@ -23,6 +26,9 @@ func (a *fakeAuditor) Record(identity, action, path, result string) error {
 }
 func (a *fakeAuditor) Page(before uint64, n int) ([]audit.Entry, error) { return a.entries, nil }
 func (a *fakeAuditor) Verify() (bool, uint64, error)                    { return true, uint64(len(a.entries)), nil }
+func (a *fakeAuditor) VerifyAnchors(*x509.CertPool) ([]audit.AnchorResult, error) {
+	return a.anchors, nil
+}
 
 func (a *fakeAuditor) writes() []audit.Entry { return a.byAction("write") }
 func (a *fakeAuditor) reads() []audit.Entry  { return a.byAction("read") }
@@ -199,5 +205,44 @@ func TestListConditionalGetNotAudited(t *testing.T) {
 	}
 	if n := len(a.byAction("list")); n != 2 {
 		t.Fatalf("changed-set list should be audited; want 2, got %d", n)
+	}
+}
+
+// The audit endpoint surfaces a live trusted-timestamp anchor summary so a
+// running node (which holds the db lock the CLI can't take) is still verifiable.
+func TestAuditEndpointAnchorSummary(t *testing.T) {
+	a := &fakeAuditor{anchors: []audit.AnchorResult{
+		{HeadSeq: 22, OK: true, Time: time.Date(2026, 6, 14, 23, 1, 14, 0, time.UTC)},
+		{HeadSeq: 30, OK: false, Err: "head hash mismatch at seq 30"},
+	}}
+	h := New(newFake(), a, nil) // open mode → admin identity
+
+	rec := do(t, h, http.MethodGet, "/v1/audit", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var resp struct {
+		Anchors struct {
+			Count            int    `json:"count"`
+			Verified         bool   `json:"verified"`
+			ProvenThroughSeq uint64 `json:"proven_through_seq"`
+			ProvenBy         string `json:"proven_by"`
+			Failures         []struct {
+				HeadSeq uint64 `json:"head_seq"`
+				Err     string `json:"err"`
+			} `json:"failures"`
+		} `json:"anchors"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Anchors.Count != 2 || resp.Anchors.Verified {
+		t.Fatalf("want count=2 verified=false, got %+v", resp.Anchors)
+	}
+	if resp.Anchors.ProvenThroughSeq != 22 || resp.Anchors.ProvenBy == "" {
+		t.Fatalf("want proven_through_seq=22 with a time, got seq=%d by=%q", resp.Anchors.ProvenThroughSeq, resp.Anchors.ProvenBy)
+	}
+	if len(resp.Anchors.Failures) != 1 || resp.Anchors.Failures[0].HeadSeq != 30 {
+		t.Fatalf("want one failure at seq 30, got %+v", resp.Anchors.Failures)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -189,6 +190,45 @@ func TestAnchorRejectsUntrustedRoot(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].OK {
 		t.Fatalf("anchor under a foreign root should fail trust: %+v", results)
+	}
+}
+
+// Verification works on a read-only reopen (the mode `stash audit verify` uses),
+// so a stopped node or an off-host copy can be checked without the writer lock.
+func TestReadOnlyVerify(t *testing.T) {
+	dir := t.TempDir()
+	key, err := LoadOrCreateKey(filepath.Join(dir, "audit.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "audit.db")
+	l, err := Open(path, "node1", WithSigningKey(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		l.Record("root", "read", "kg/web/X", "ok")
+	}
+	tsa := newFakeTSA(t, time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC))
+	if _, err := l.Anchor(context.Background(), tsa.anchorer()); err != nil {
+		t.Fatal(err)
+	}
+	l.Close() // release the writer lock
+
+	ro, err := Open(path, "", WithReadOnly(), WithSigningKey(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if intact, count, _ := ro.Verify(); !intact || count != 3 {
+		t.Fatalf("read-only chain verify: intact=%v count=%d", intact, count)
+	}
+	results, err := ro.VerifyAnchors(tsa.roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || !results[0].OK {
+		t.Fatalf("read-only anchor verify: %+v", results)
 	}
 }
 

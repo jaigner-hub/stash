@@ -330,9 +330,11 @@ func cmdAudit(args []string) error {
 		return err
 	}
 
-	// Use the signing key for full signature verification if it sits beside the
-	// db; otherwise verify the chain only (e.g. on a copy shipped off-host).
-	var opts []audit.Option
+	// Read-only so a verify against a live node's data dir fails fast (the server
+	// holds the writer lock) instead of hanging. Use the signing key for full
+	// signature verification if it sits beside the db; otherwise verify the chain
+	// only (e.g. on a copy shipped off-host).
+	opts := []audit.Option{audit.WithReadOnly()}
 	signed := "chain only (audit.key not present)"
 	if keyPath := filepath.Join(*dir, "audit.key"); fileExists(keyPath) {
 		key, err := audit.LoadOrCreateKey(keyPath)

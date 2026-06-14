@@ -65,9 +65,10 @@ type Entry struct {
 // Log is an append-only, hash-chained, optionally Ed25519-signed audit log
 // backed by bbolt.
 type Log struct {
-	db   *bolt.DB
-	node string
-	priv ed25519.PrivateKey // signing key; nil leaves entries chain-only
+	db       *bolt.DB
+	node     string
+	priv     ed25519.PrivateKey // signing key; nil leaves entries chain-only
+	readOnly bool               // opened for verification only (shared lock)
 
 	mu   sync.Mutex
 	seq  uint64
@@ -87,6 +88,14 @@ func WithSigningKey(key ed25519.PrivateKey) Option {
 			l.priv = key
 		}
 	}
+}
+
+// WithReadOnly opens the bbolt file read-only with a short lock timeout, so
+// verifying a log whose writer (the running server) holds the exclusive lock
+// fails fast with a clear error instead of blocking. Use it for offline
+// verification of a stopped node or an off-host copy; Record must not be called.
+func WithReadOnly() Option {
+	return func(l *Log) { l.readOnly = true }
 }
 
 // PublicKey returns the verifying key for this log's signatures, or nil if
@@ -151,20 +160,33 @@ func (l *Log) Stream(sink func(Entry)) {
 
 // Open opens (creating if needed) the audit log at path, attributing entries to
 // node. It recovers the latest sequence/hash so the chain continues across
-// restarts. Pass WithSigningKey to enable per-entry signatures.
+// restarts. Pass WithSigningKey to enable per-entry signatures, or WithReadOnly
+// to verify a log without taking the writer lock.
 func Open(path, node string, opts ...Option) (*Log, error) {
-	db, err := bolt.Open(path, 0o600, nil)
-	if err != nil {
-		return nil, fmt.Errorf("audit: open %s: %w", path, err)
-	}
-	l := &Log{db: db, node: node}
+	l := &Log{node: node}
 	for _, opt := range opts {
 		opt(l)
 	}
-	err = db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(bucket)
-		if err != nil {
-			return err
+	var bopts *bolt.Options
+	if l.readOnly {
+		// Shared lock + short timeout: opening a db whose writer (the running
+		// server) holds the exclusive lock fails fast instead of blocking forever.
+		bopts = &bolt.Options{ReadOnly: true, Timeout: 3 * time.Second}
+	}
+	db, err := bolt.Open(path, 0o600, bopts)
+	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, fmt.Errorf("audit: %s is locked by the running stash server — "+
+				"verify on a stopped node, an off-host copy, or via the API: %w", path, err)
+		}
+		return nil, fmt.Errorf("audit: open %s: %w", path, err)
+	}
+	l.db = db
+
+	recover := func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
+		if b == nil {
+			return nil // fresh / empty log
 		}
 		if k, v := b.Cursor().Last(); k != nil {
 			l.seq = binary.BigEndian.Uint64(k)
@@ -174,7 +196,17 @@ func Open(path, node string, opts ...Option) (*Log, error) {
 			}
 		}
 		return nil
-	})
+	}
+	if l.readOnly {
+		err = db.View(recover) // can't create buckets in a read-only tx
+	} else {
+		err = db.Update(func(tx *bolt.Tx) error {
+			if _, e := tx.CreateBucketIfNotExists(bucket); e != nil {
+				return e
+			}
+			return recover(tx)
+		})
+	}
 	if err != nil {
 		db.Close()
 		return nil, err
