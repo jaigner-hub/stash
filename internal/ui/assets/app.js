@@ -154,15 +154,11 @@ async function reveal(tr, path) {
   cell.innerHTML = "";
   const code = document.createElement("code");
   code.textContent = value;
-  const copy = document.createElement("button");
-  copy.textContent = "Copy";
-  copy.className = "link";
-  copy.onclick = (e) => copyValue(value, e.currentTarget);
   const hide = document.createElement("button");
   hide.textContent = "Hide";
   hide.className = "link";
   hide.onclick = () => { cell.innerHTML = '<span class="muted">••••••••</span>'; };
-  cell.append(code, " ", copy, hide);
+  cell.append(code, " ", hide);
 }
 
 async function editSecret(path) {
