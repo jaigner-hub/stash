@@ -298,6 +298,7 @@ internal/ui/assets/{index.html,style.css,app.js}  →  go:embed  →  served at 
 | Method | Path | Body | Result |
 |---|---|---|---|
 | `GET`    | `/v1/health`         | — | `{"status","sealed","is_leader"}` |
+| `GET`    | `/metrics`           | — | Prometheus gauges: `stash_up`, `stash_sealed`, `stash_is_leader`, `stash_raft_has_leader`, `stash_raft_voters`, `stash_raft_members` |
 | `GET`    | `/v1/secrets`        | — | `{"keys":[...]}` |
 | `GET`    | `/v1/secret/<path>`  | — | `{"value":"..."}` (optional `?version=N`) |
 | `GET`    | `/v1/versions/<path>` | — | `{"versions":[{"seq","time"},…]}` |
@@ -313,7 +314,9 @@ internal/ui/assets/{index.html,style.css,app.js}  →  go:embed  →  served at 
 
 All `/v1/secret*`, `/v1/secrets`, `/v1/cluster/status`, and `/v1/identities`
 routes require a bearer token (unless the cluster is in open mode). `/v1/health`
-is always open; `/v1/cluster/join` is gated by the join secret instead.
+and `/metrics` are always open (the latter exposes only role/seal/leader/voter
+gauges — no secret material or addresses); `/v1/cluster/join` is gated by the join
+secret instead.
 
 `<path>` may contain slashes (`kg/web/SECRET_KEY`).
 
