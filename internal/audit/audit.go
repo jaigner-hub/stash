@@ -41,6 +41,17 @@ type Log struct {
 	mu   sync.Mutex
 	seq  uint64
 	last string
+	sink func(Entry) // optional; invoked with each newly recorded entry
+}
+
+// Stream registers a sink invoked with each entry right after it is durably
+// persisted (so the on-disk chain stays the source of truth). It's how the
+// per-node log ships to a central store like Loki for a unified, durable view.
+// The sink must not block; pass nil to disable.
+func (l *Log) Stream(sink func(Entry)) {
+	l.mu.Lock()
+	l.sink = sink
+	l.mu.Unlock()
 }
 
 // Open opens (creating if needed) the audit log at path, attributing entries to
@@ -113,6 +124,9 @@ func (l *Log) Record(identity, action, path, result string) error {
 	}
 	l.seq = e.Seq
 	l.last = e.Hash
+	if l.sink != nil {
+		l.sink(e) // best-effort ship; must not block (see Stream)
+	}
 	return nil
 }
 

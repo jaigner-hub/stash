@@ -142,6 +142,7 @@ func cmdServer(args []string) error {
 	advertise := fs.String("advertise-http", "", "API URL peers use to reach this node (default: detected)")
 	bootstrap := fs.Bool("bootstrap", false, "form a new cluster (first node only)")
 	noTLS := fs.Bool("no-tls", false, "disable mutual TLS (insecure; local dev only). TLS is on by default")
+	auditLoki := fs.String("audit-loki", os.Getenv("STASH_AUDIT_LOKI"), "ship the audit log to this Loki base URL (e.g. http://loki:3100); also $STASH_AUDIT_LOKI")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -242,8 +243,21 @@ func cmdServer(args []string) error {
 		return err
 	}
 	defer aud.Close()
+	streamAuditToLoki(aud, cfg.NodeID, *auditLoki, log)
 
 	return serve(node, aud, listenAddr, kek, log)
+}
+
+// streamAuditToLoki ships each new audit entry to Loki when a URL is configured.
+// Best-effort (the local hash-chained log stays the source of truth); the HTTP
+// client is plain, since Loki is reached over the trusted tailnet, not the
+// cluster's mTLS CA.
+func streamAuditToLoki(aud *audit.Log, node, lokiURL string, log *slog.Logger) {
+	if lokiURL == "" {
+		return
+	}
+	aud.Stream(newLokiShipper(lokiURL, node, nil, log).ship)
+	log.Info("shipping audit log to Loki", "url", lokiURL)
 }
 
 func cmdJoin(args []string) error {
@@ -258,6 +272,7 @@ func cmdJoin(args []string) error {
 	raftPort := fs.Int("raft-port", 8300, "local raft port")
 	keyOut := fs.String("unseal-key-out", "", "where to store the unseal key from the token (default: <data>/unseal.key)")
 	noKey := fs.Bool("no-key", false, "ignore any key in the token and join as a sealed witness")
+	auditLoki := fs.String("audit-loki", os.Getenv("STASH_AUDIT_LOKI"), "ship the audit log to this Loki base URL (e.g. http://loki:3100); also $STASH_AUDIT_LOKI")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -366,6 +381,7 @@ func cmdJoin(args []string) error {
 		return err
 	}
 	defer aud.Close()
+	streamAuditToLoki(aud, id, *auditLoki, log)
 
 	return serve(node, aud, *listen, kek, log)
 }

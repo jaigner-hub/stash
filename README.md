@@ -249,6 +249,14 @@ lives in its own `audit.db`, separate from the replicated store. View it at
 console's Audit panel, which shows entries (with a Load-more button) and a
 chain-integrity indicator.
 
+**Shipping to Loki.** Because the log is per-node, a full view means querying
+every node, and a node's local log dies with its disk. Point `stash server`/`join`
+at a Loki push endpoint — `-audit-loki http://loki:3100` (or `$STASH_AUDIT_LOKI`)
+— and each node streams its entries (labelled `job="stash-audit", node="…"`) to
+Loki for one durable, queryable view across the cluster. It's **best-effort**: the
+local hash-chained `audit.db` stays the source of truth, so a Loki outage just
+pauses shipping — nothing blocks and no audited operation is lost.
+
 ## Agent (render to file + self-heal)
 
 `stash agent` renders secrets into a local file from a template and keeps a
