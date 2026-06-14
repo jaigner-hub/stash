@@ -31,6 +31,7 @@ type command struct {
 	Op         cmdOp  `json:"op"`
 	Path       string `json:"path,omitempty"`
 	Blob       []byte `json:"blob,omitempty"`
+	Ts         string `json:"ts,omitempty"` // leader-stamped time for versioning
 	WrappedDEK []byte `json:"wrapped_dek,omitempty"`
 	Canary     []byte `json:"canary,omitempty"`
 	NodeID     string `json:"node_id,omitempty"`
@@ -69,7 +70,7 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	case opInit:
 		return f.store.PutMeta(c.WrappedDEK, c.Canary)
 	case opPut:
-		return f.store.PutRaw(c.Path, c.Blob)
+		return f.store.PutVersionedRaw(c.Path, c.Blob, c.Ts, store.MaxVersions)
 	case opDelete:
 		return f.store.DeleteRaw(c.Path)
 	case opMeta:

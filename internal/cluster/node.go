@@ -147,7 +147,21 @@ func (n *Node) Put(path string, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return n.apply(command{Op: opPut, Path: path, Blob: blob})
+	return n.apply(command{Op: opPut, Path: path, Blob: blob, Ts: nowRFC3339()})
+}
+
+// ListVersions returns version metadata for path, newest first.
+func (n *Node) ListVersions(path string) ([]store.VersionMeta, error) {
+	return n.store.ListVersions(path)
+}
+
+// GetVersion returns the decrypted value of a specific version.
+func (n *Node) GetVersion(path string, seq uint64) ([]byte, error) {
+	blob, err := n.store.GetVersionRaw(path, seq)
+	if err != nil {
+		return nil, err
+	}
+	return n.store.Decrypt(path, blob)
 }
 
 // Delete removes path via Raft, returning store.ErrNotFound if absent.

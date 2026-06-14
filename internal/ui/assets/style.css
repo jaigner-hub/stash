@@ -109,3 +109,8 @@ button.link { background: transparent; border: none; color: var(--accent); paddi
 }
 .token-box code { color: var(--accent); word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .token-box.err { border-color: var(--danger); }
+
+/* version history */
+.history-row > td { background: var(--panel-2); }
+.history-item { padding: 4px 0; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.history-item code { color: var(--accent); word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }

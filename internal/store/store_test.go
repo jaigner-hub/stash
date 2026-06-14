@@ -141,6 +141,81 @@ func TestUnsealNotInitialized(t *testing.T) {
 	}
 }
 
+func TestVersioning(t *testing.T) {
+	s := newStore(t)
+	if err := s.Init(mustKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	for i, val := range []string{"v1", "v2", "v3"} {
+		blob, err := s.Encrypt("p", []byte(val))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutVersionedRaw("p", blob, []string{"t1", "t2", "t3"}[i], 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vers, err := s.ListVersions("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vers) != 3 || vers[0].Seq != 3 || vers[2].Seq != 1 {
+		t.Fatalf("versions (newest first) wrong: %+v", vers)
+	}
+	b1, err := s.GetVersionRaw("p", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, err := s.Decrypt("p", b1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(pt) != "v1" {
+		t.Fatalf("version 1 = %q, want v1", pt)
+	}
+	if cur, _ := s.Get("p"); string(cur) != "v3" {
+		t.Fatalf("current = %q, want v3", cur)
+	}
+}
+
+func TestVersionPrune(t *testing.T) {
+	s := newStore(t)
+	if err := s.Init(mustKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 15; i++ {
+		blob, _ := s.Encrypt("p", []byte{byte(i)})
+		if err := s.PutVersionedRaw("p", blob, "t", 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vers, _ := s.ListVersions("p")
+	if len(vers) != 10 {
+		t.Fatalf("want 10 kept, got %d", len(vers))
+	}
+	if vers[0].Seq != 15 || vers[9].Seq != 6 {
+		t.Fatalf("prune kept wrong range: %d..%d", vers[0].Seq, vers[9].Seq)
+	}
+	if _, err := s.GetVersionRaw("p", 1); !errors.Is(err, ErrNotFound) {
+		t.Fatal("version 1 should have been pruned")
+	}
+}
+
+func TestDeleteClearsVersions(t *testing.T) {
+	s := newStore(t)
+	if err := s.Init(mustKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	blob, _ := s.Encrypt("p", []byte("x"))
+	s.PutVersionedRaw("p", blob, "t", 10)
+	if err := s.DeleteRaw("p"); err != nil {
+		t.Fatal(err)
+	}
+	if vers, _ := s.ListVersions("p"); len(vers) != 0 {
+		t.Fatalf("versions should be cleared, got %d", len(vers))
+	}
+}
+
 func TestList(t *testing.T) {
 	s := newStore(t)
 	if err := s.Init(mustKey(t)); err != nil {

@@ -5,9 +5,9 @@ secret storage that is genuinely *easy* to stand up — no external database, no
 Redis, no Kubernetes. One Go binary that does it all, replicating state with
 embedded Raft.
 
-> **Status: milestone 6 — audit log.** This is a hobby project and is **not
-> production-ready**. Do not trust it with real secrets yet. (For the keygrip
-> dev pair, SOPS stays authoritative until this is battle-tested.)
+> **Status: milestone 7 — secret versioning.** This is a hobby project and is
+> **not production-ready**. Do not trust it with real secrets yet. (For the
+> keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
 
 ## Why
 
@@ -146,6 +146,19 @@ curl -H "Authorization: Bearer $ROOT" -X POST $API/v1/identities \
 # -> {"name":"ci","token":"stash-…"}   (shown once)
 ```
 
+## Versioning
+
+Every write keeps the previous values: the last `MaxVersions` (10) versions per
+path are retained, each stamped with the time the leader applied it. Version
+sequences are assigned by the FSM, so every replica derives the same history.
+
+- `GET /v1/versions/<path>` lists versions (newest first).
+- `GET /v1/secret/<path>?version=N` reads a specific version.
+- **Restore** = read an old version and write it back (creating a new current
+  version) — exposed as a button in the console's per-secret History view.
+
+Deleting a secret also clears its version history.
+
 ## Audit log
 
 Every secret read/write/delete/list and identity change is recorded in a
@@ -181,7 +194,8 @@ internal/ui/assets/{index.html,style.css,app.js}  →  go:embed  →  served at 
 |---|---|---|---|
 | `GET`    | `/v1/health`         | — | `{"status","sealed","is_leader"}` |
 | `GET`    | `/v1/secrets`        | — | `{"keys":[...]}` |
-| `GET`    | `/v1/secret/<path>`  | — | `{"value":"..."}` |
+| `GET`    | `/v1/secret/<path>`  | — | `{"value":"..."}` (optional `?version=N`) |
+| `GET`    | `/v1/versions/<path>` | — | `{"versions":[{"seq","time"},…]}` |
 | `PUT`    | `/v1/secret/<path>`  | `{"value":"..."}` | `204` (forwarded to leader) |
 | `DELETE` | `/v1/secret/<path>`  | — | `204` (forwarded to leader) |
 | `POST`   | `/v1/cluster/join`   | `{"node_id","raft_addr","http_addr","secret"}` | `200` (secret-gated) |
@@ -209,7 +223,7 @@ and each later milestone now *feeds* it (audit view, history/diff, login).
 - [x] **M4 — Web UI v1**: embedded console (dependency-free, tailnet-gated) — view/add/edit/delete secrets, cluster health.
 - [x] **M5 — identity & access**: bearer-token identities (hashed at rest) + path-prefix ACLs; root token; UI login + Identities panel; open-mode for upgrades.
 - [x] **M6 — audit**: per-node hash-chained append-only audit log (reads, writes, denials, identity changes); admin API + UI panel with chain-integrity check.
-- [ ] **M7 — versioning**: keep last N versions per path; UI gains history/diff.
+- [x] **M7 — versioning**: keep last N versions per path (replicated, pruned); read any version; UI History view with view + restore.
 - [ ] **M8 — agent**: `stash agent` renders secrets → tmpfs with last-good cache (reboot-during-outage self-heal).
 - [ ] follow-ups: join-secret rotation (`stash token rotate`), inter-node mTLS (CA fingerprint in token), Tailscale auto-discovery, ship audit log to Loki.
 

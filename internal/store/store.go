@@ -15,12 +15,18 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/jaigner-hub/stash/internal/crypto"
 	bolt "go.etcd.io/bbolt"
 )
+
+// MaxVersions is how many historical versions are kept per secret path.
+const MaxVersions = 10
 
 var (
 	// ErrNotFound is returned by Get/Delete when a path has no value.
@@ -39,6 +45,7 @@ var (
 	metaBucket       = []byte("meta")
 	secretsBucket    = []byte("secrets")
 	identitiesBucket = []byte("identities")
+	versionsBucket   = []byte("versions")
 
 	keyWrappedDEK = []byte("wrapped_dek")
 	keyCanary     = []byte("canary")
@@ -71,7 +78,7 @@ func Open(path string) (*Store, error) {
 
 func ensureBuckets(db *bolt.DB) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{metaBucket, secretsBucket, identitiesBucket} {
+		for _, b := range [][]byte{metaBucket, secretsBucket, identitiesBucket, versionsBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -188,11 +195,131 @@ func (s *Store) GetRaw(path string) ([]byte, error) {
 	return blob, nil
 }
 
-// DeleteRaw removes path. It is idempotent (no error if absent).
+// DeleteRaw removes path and all its versions. Idempotent.
 func (s *Store) DeleteRaw(path string) error {
+	pfx := versionPrefix(path)
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(secretsBucket).Delete([]byte(path))
+		if err := tx.Bucket(secretsBucket).Delete([]byte(path)); err != nil {
+			return err
+		}
+		vb := tx.Bucket(versionsBucket)
+		c := vb.Cursor()
+		var keys [][]byte
+		for k, _ := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, _ = c.Next() {
+			keys = append(keys, append([]byte(nil), k...))
+		}
+		for _, k := range keys {
+			if err := vb.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+// VersionMeta describes one historical version (no value).
+type VersionMeta struct {
+	Seq  uint64 `json:"seq"`
+	Time string `json:"time"`
+}
+
+type versionRecord struct {
+	Time string `json:"t"`
+	Blob []byte `json:"b"`
+}
+
+// version keys are path + 0x00 + big-endian seq, so they sort by (path, seq).
+func versionPrefix(path string) []byte { return append([]byte(path), 0) }
+
+func versionKey(path string, seq uint64) []byte {
+	k := versionPrefix(path)
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, seq)
+	return append(k, b...)
+}
+
+// PutVersionedRaw sets the current value (ciphertext) and appends a new version
+// stamped with ts, pruning to keepN most-recent versions. Used by the Raft FSM
+// so every replica derives identical version sequences.
+func (s *Store) PutVersionedRaw(path string, blob []byte, ts string, keepN int) error {
+	rec, err := json.Marshal(versionRecord{Time: ts, Blob: blob})
+	if err != nil {
+		return err
+	}
+	pfx := versionPrefix(path)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(secretsBucket).Put([]byte(path), blob); err != nil {
+			return err
+		}
+		vb := tx.Bucket(versionsBucket)
+		var maxSeq uint64
+		var keys [][]byte
+		c := vb.Cursor()
+		for k, _ := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, _ = c.Next() {
+			if seq := binary.BigEndian.Uint64(k[len(pfx):]); seq > maxSeq {
+				maxSeq = seq
+			}
+			keys = append(keys, append([]byte(nil), k...))
+		}
+		if err := vb.Put(versionKey(path, maxSeq+1), rec); err != nil {
+			return err
+		}
+		// keys is ascending by seq; drop the oldest beyond keepN (+1 for the new).
+		if drop := len(keys) + 1 - keepN; drop > 0 {
+			for i := 0; i < drop && i < len(keys); i++ {
+				if err := vb.Delete(keys[i]); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// ListVersions returns version metadata for path, newest first.
+func (s *Store) ListVersions(path string) ([]VersionMeta, error) {
+	pfx := versionPrefix(path)
+	var out []VersionMeta
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(versionsBucket).Cursor()
+		for k, v := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, v = c.Next() {
+			var rec versionRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return err
+			}
+			out = append(out, VersionMeta{Seq: binary.BigEndian.Uint64(k[len(pfx):]), Time: rec.Time})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq > out[j].Seq })
+	return out, nil
+}
+
+// GetVersionRaw returns the stored ciphertext for a specific version.
+func (s *Store) GetVersionRaw(path string, seq uint64) ([]byte, error) {
+	var blob []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(versionsBucket).Get(versionKey(path, seq))
+		if v == nil {
+			return nil
+		}
+		var rec versionRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			return err
+		}
+		blob = rec.Blob
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if blob == nil {
+		return nil, ErrNotFound
+	}
+	return blob, nil
 }
 
 // Exists reports whether path has a stored value. Does not require unseal.
@@ -315,6 +442,15 @@ type Snapshot struct {
 	Canary     []byte            `json:"canary"`
 	Secrets    map[string][]byte `json:"secrets"`
 	Identities map[string][]byte `json:"identities"`
+	// Versions use binary keys (path\0seq), so they can't be JSON map keys;
+	// store them as explicit key/value pairs ([]byte marshals as base64).
+	Versions []KV `json:"versions"`
+}
+
+// KV is a raw key/value pair used for snapshotting buckets with binary keys.
+type KV struct {
+	K []byte `json:"k"`
+	V []byte `json:"v"`
 }
 
 // Export captures the full store state for a Raft snapshot.
@@ -330,8 +466,17 @@ func (s *Store) Export() (*Snapshot, error) {
 		}); err != nil {
 			return err
 		}
-		return tx.Bucket(identitiesBucket).ForEach(func(k, v []byte) error {
+		if err := tx.Bucket(identitiesBucket).ForEach(func(k, v []byte) error {
 			snap.Identities[string(k)] = append([]byte(nil), v...)
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.Bucket(versionsBucket).ForEach(func(k, v []byte) error {
+			snap.Versions = append(snap.Versions, KV{
+				K: append([]byte(nil), k...),
+				V: append([]byte(nil), v...),
+			})
 			return nil
 		})
 	})
@@ -365,6 +510,18 @@ func (s *Store) Import(snap *Snapshot) error {
 		}
 		for k, v := range snap.Identities {
 			if err := ib.Put([]byte(k), v); err != nil {
+				return err
+			}
+		}
+		if err := tx.DeleteBucket(versionsBucket); err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
+			return err
+		}
+		vb, err := tx.CreateBucket(versionsBucket)
+		if err != nil {
+			return err
+		}
+		for _, kv := range snap.Versions {
+			if err := vb.Put(kv.K, kv.V); err != nil {
 				return err
 			}
 		}

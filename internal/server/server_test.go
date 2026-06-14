@@ -113,6 +113,19 @@ func (f *fakeBackend) ListIdentities() ([]cluster.Identity, error) {
 	}
 	return out, nil
 }
+func (f *fakeBackend) ListVersions(p string) ([]store.VersionMeta, error) {
+	if _, ok := f.data[p]; !ok {
+		return nil, nil
+	}
+	return []store.VersionMeta{{Seq: 1, Time: "2026-01-01T00:00:00Z"}}, nil
+}
+func (f *fakeBackend) GetVersion(p string, seq uint64) ([]byte, error) {
+	v, ok := f.data[p]
+	if !ok || seq != 1 {
+		return nil, store.ErrNotFound
+	}
+	return v, nil
+}
 
 func do(t *testing.T, h http.Handler, method, target string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()

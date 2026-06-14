@@ -48,6 +48,8 @@ type Backend interface {
 	CreateIdentity(name string, admin bool, policies []cluster.Policy) (string, error)
 	DeleteIdentity(name string) error
 	ListIdentities() ([]cluster.Identity, error)
+	ListVersions(path string) ([]store.VersionMeta, error)
+	GetVersion(path string, seq uint64) ([]byte, error)
 }
 
 type server struct {
@@ -67,6 +69,7 @@ func New(b Backend, auditor Auditor, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /v1/health", srv.health)
 	mux.HandleFunc("GET /v1/secrets", srv.list)
 	mux.HandleFunc("GET /v1/secret/{path...}", srv.get)
+	mux.HandleFunc("GET /v1/versions/{path...}", srv.versions)
 	mux.HandleFunc("PUT /v1/secret/{path...}", srv.put)
 	mux.HandleFunc("DELETE /v1/secret/{path...}", srv.delete)
 	mux.HandleFunc("POST /v1/cluster/join", srv.join)
@@ -158,6 +161,27 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		forbid(w)
 		return
 	}
+	// Optional ?version=N reads a specific historical version.
+	if vs := r.URL.Query().Get("version"); vs != "" {
+		seq, err := strconv.ParseUint(vs, 10, 64)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid version"})
+			return
+		}
+		v, err := s.backend.GetVersion(path, seq)
+		if err != nil {
+			result := "error"
+			if errors.Is(err, store.ErrNotFound) {
+				result = "not_found"
+			}
+			s.record(id, "read", path, result)
+			s.writeErr(w, err)
+			return
+		}
+		s.record(id, "read", path, "ok")
+		writeJSON(w, http.StatusOK, secretBody{Value: string(v)})
+		return
+	}
 	v, err := s.backend.Get(path)
 	if err != nil {
 		result := "error"
@@ -170,6 +194,27 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	}
 	s.record(id, "read", path, "ok")
 	writeJSON(w, http.StatusOK, secretBody{Value: string(v)})
+}
+
+func (s *server) versions(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	path := r.PathValue("path")
+	if !id.Can(cluster.CapRead, path) {
+		forbid(w)
+		return
+	}
+	vs, err := s.backend.ListVersions(path)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if vs == nil {
+		vs = []store.VersionMeta{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
 }
 
 func (s *server) put(w http.ResponseWriter, r *http.Request) {

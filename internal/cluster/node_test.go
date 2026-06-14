@@ -96,6 +96,40 @@ func TestSingleNodeCRUD(t *testing.T) {
 	}
 }
 
+func TestNodeVersioning(t *testing.T) {
+	kek := mustKey(t)
+	n, _, _ := newNode(t, "n1", true)
+	if _, err := n.Initialize(kek, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Unseal(kek, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Put("p", []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Put("p", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	vers, err := n.ListVersions("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vers) != 2 {
+		t.Fatalf("want 2 versions, got %d", len(vers))
+	}
+	old, err := n.GetVersion("p", vers[1].Seq) // newest-first, so [1] is the older
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(old) != "one" {
+		t.Fatalf("old version = %q, want one", old)
+	}
+	if cur, _ := n.Get("p"); string(cur) != "two" {
+		t.Fatalf("current = %q, want two", cur)
+	}
+}
+
 func TestThreeNodeReplication(t *testing.T) {
 	kek := mustKey(t)
 	n1, _, h1 := newNode(t, "n1", true)

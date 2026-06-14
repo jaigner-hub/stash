@@ -105,10 +105,12 @@ function renderSecrets() {
       `<td class="row-actions">` +
       `<button data-act="copy">Copy</button> ` +
       `<button data-act="reveal">Reveal</button> ` +
+      `<button data-act="history">History</button> ` +
       `<button data-act="edit">Edit</button> ` +
       `<button data-act="del" class="danger">Delete</button></td>`;
     tr.querySelector("[data-act=copy]").onclick = (e) => copySecret(p, e.currentTarget);
     tr.querySelector("[data-act=reveal]").onclick = (e) => toggleReveal(tr, p, e.currentTarget);
+    tr.querySelector("[data-act=history]").onclick = (e) => toggleHistory(tr, p, e.currentTarget);
     tr.querySelector("[data-act=edit]").onclick = () => editSecret(p);
     tr.querySelector("[data-act=del]").onclick = () => del(p);
     body.appendChild(tr);
@@ -187,6 +189,77 @@ async function toggleReveal(tr, path, btn) {
   cell.appendChild(code);
   btn.textContent = "Hide";
   btn.dataset.shown = "1";
+}
+
+// toggleHistory shows/hides a per-secret version history row.
+async function toggleHistory(tr, path, btn) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("history-row")) {
+    next.remove();
+    btn.textContent = "History";
+    return;
+  }
+  const r = await authFetch("/v1/versions/" + path.split("/").map(encodeURIComponent).join("/"));
+  if (!r.ok) return;
+  const data = await r.json();
+  const row = document.createElement("tr");
+  row.className = "history-row";
+  const td = document.createElement("td");
+  td.colSpan = 3;
+
+  const versions = data.versions || [];
+  if (versions.length === 0) {
+    td.innerHTML = '<span class="muted">no history</span>';
+  } else {
+    versions.forEach((v) => {
+      const item = document.createElement("div");
+      item.className = "history-item";
+      const t = (v.time || "").replace("T", " ").replace(/\.\d+/, "").replace("Z", "");
+      const label = document.createElement("span");
+      label.className = "muted";
+      label.textContent = `v${v.seq} · ${t}`;
+      const view = document.createElement("button");
+      view.className = "link";
+      view.textContent = "View";
+      view.onclick = () => viewVersion(item, path, v.seq);
+      const restore = document.createElement("button");
+      restore.className = "link";
+      restore.textContent = "Restore";
+      restore.onclick = () => restoreVersion(path, v.seq);
+      item.append(label, " ", view, restore);
+      td.appendChild(item);
+    });
+  }
+  row.appendChild(td);
+  tr.after(row);
+  btn.textContent = "Hide";
+}
+
+async function viewVersion(item, path, seq) {
+  const existing = item.querySelector("code");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  const r = await authFetch(pathURL(path) + "?version=" + seq);
+  if (!r.ok) return;
+  const { value } = await r.json();
+  const code = document.createElement("code");
+  code.textContent = value;
+  code.style.marginLeft = "8px";
+  item.appendChild(code);
+}
+
+async function restoreVersion(path, seq) {
+  if (!confirm(`Restore ${path} to v${seq}? This creates a new version with that value.`)) return;
+  const r = await authFetch(pathURL(path) + "?version=" + seq);
+  if (!r.ok) return;
+  const { value } = await r.json();
+  const pr = await apiJSON("PUT", pathURL(path), { value });
+  if (pr.ok) {
+    loadSecrets();
+    loadAudit();
+  }
 }
 
 async function editSecret(path) {
