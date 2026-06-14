@@ -86,7 +86,8 @@ usage:
   stash server [flags]                     restart an existing node
   stash join   <token> [flags]             add a node (addresses auto-detected)
   stash token  [--no-key] [flags]          mint another join token
-  stash agent  -template T -out O [flags]  render secrets to a file (last-good cache)
+  stash agent  -auto -prefix P -out O      render every readable secret to a file (KEY=value)
+  stash agent  -template T -out O [flags]   render secrets via a template (last-good cache)
 
 run "stash <command> -h" for command flags.
 `)
@@ -411,7 +412,10 @@ func cmdAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	api := fs.String("api", "http://127.0.0.1:8200", "stash API URL")
 	tokenFlag := fs.String("token", "", `access token (or $STASH_TOKEN)`)
-	tmpl := fs.String("template", "", `template file using {{secret "path"}} (required)`)
+	tmpl := fs.String("template", "", `template file using {{secret "path"}} (template mode)`)
+	auto := fs.Bool("auto", false, "render every readable secret under -prefix as KEY=value (no template needed)")
+	prefix := fs.String("prefix", "", "with -auto: render secrets under this path prefix (e.g. kg/web)")
+	overlay := fs.String("overlay", "", "with -auto: a prefix whose direct keys override the base (e.g. per-host kg/web/<node>)")
 	out := fs.String("out", "", "output file, typically on tmpfs (required)")
 	cache := fs.String("cache", "", "last-good cache on persistent disk (default <out>.last)")
 	interval := fs.Duration("interval", 0, "re-render every interval; 0 = render once and exit")
@@ -420,8 +424,17 @@ func cmdAgent(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *tmpl == "" || *out == "" {
-		return errors.New("-template and -out are required")
+	if *out == "" {
+		return errors.New("-out is required")
+	}
+	if *auto && *tmpl != "" {
+		return errors.New("-auto and -template are mutually exclusive")
+	}
+	if !*auto && *tmpl == "" {
+		return errors.New("one of -template or -auto is required")
+	}
+	if *auto && *prefix == "" {
+		return errors.New("-auto requires -prefix")
 	}
 	tok := *tokenFlag
 	if tok == "" {
@@ -475,11 +488,45 @@ func cmdAgent(args []string) error {
 		return body.Value, nil
 	}
 
-	cfg := agent.Config{Template: *tmpl, Out: *out, Cache: cachePath}
+	// list returns the secret paths this token may read (the server scopes it to
+	// the identity's ACL) — the set that -auto renders.
+	list := func() ([]string, error) {
+		req, err := http.NewRequest(http.MethodGet, base+"/v1/secrets", nil)
+		if err != nil {
+			return nil, err
+		}
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("list secrets: status %d", resp.StatusCode)
+		}
+		var body struct {
+			Keys []string `json:"keys"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return nil, err
+		}
+		return body.Keys, nil
+	}
+
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	render := func() (agent.Result, error) {
+		if *auto {
+			return agent.RenderAutoOnce(agent.AutoConfig{
+				Prefix: *prefix, Overlay: *overlay, Out: *out, Cache: cachePath,
+			}, list, fetch)
+		}
+		return agent.RenderOnce(agent.Config{Template: *tmpl, Out: *out, Cache: cachePath}, fetch)
+	}
 
 	renderOnce := func() error {
-		res, err := agent.RenderOnce(cfg, fetch)
+		res, err := render()
 		switch {
 		case err != nil:
 			return err

@@ -115,3 +115,105 @@ func TestRenderOnceNoCacheNoFallback(t *testing.T) {
 		t.Fatal("expected hard error when render fails and no cache exists")
 	}
 }
+
+func TestEnvName(t *testing.T) {
+	cases := map[string]string{
+		"db_password": "DB_PASSWORD",
+		"sentry_dsn":  "SENTRY_DSN",
+		"api-key":     "API_KEY",
+		"a.b":         "A_B",
+	}
+	for in, want := range cases {
+		if got := EnvName(in); got != want {
+			t.Errorf("EnvName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDirectChild(t *testing.T) {
+	if leaf, ok := directChild("kg/web", "kg/web/db_password"); !ok || leaf != "db_password" {
+		t.Errorf("direct child: leaf=%q ok=%v", leaf, ok)
+	}
+	// nested (a namespace, e.g. per-host overlay) is NOT a direct child of the base
+	if _, ok := directChild("kg/web", "kg/web/vent.dog2/sentry_dsn"); ok {
+		t.Error("nested path should not be a direct child of the base prefix")
+	}
+	// but it IS a direct child of the overlay prefix
+	if leaf, ok := directChild("kg/web/vent.dog2", "kg/web/vent.dog2/sentry_dsn"); !ok || leaf != "sentry_dsn" {
+		t.Errorf("overlay child: leaf=%q ok=%v", leaf, ok)
+	}
+	// a sibling prefix must not match
+	if _, ok := directChild("kg/web", "kg/api/token"); ok {
+		t.Error("different prefix should not match")
+	}
+}
+
+func TestRenderAutoOnce(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.env")
+	cache := filepath.Join(dir, "out.last")
+
+	store := map[string]string{
+		"kg/web/db_password":           "pw",
+		"kg/web/sentry_dsn":            "base-dsn",   // base value
+		"kg/web/vent.dog2/sentry_dsn":  "host-dsn",   // overlay overrides on this host
+		"kg/api/token":                 "nope",       // outside prefix, must be ignored
+	}
+	list := func() ([]string, error) {
+		ks := make([]string, 0, len(store))
+		for k := range store {
+			ks = append(ks, k)
+		}
+		return ks, nil
+	}
+	fetch := func(p string) (string, error) { return store[p], nil }
+
+	cfg := AutoConfig{Prefix: "kg/web", Overlay: "kg/web/vent.dog2", Out: out, Cache: cache}
+	res, err := RenderAutoOnce(cfg, list, fetch)
+	if err != nil || !res.Changed {
+		t.Fatalf("auto render: %+v err=%v", res, err)
+	}
+	// sorted, overlay wins for SENTRY_DSN, kg/api ignored, nested base path not junk-rendered
+	want := "DB_PASSWORD=pw\nSENTRY_DSN=host-dsn\n"
+	if b, _ := os.ReadFile(out); string(b) != want {
+		t.Fatalf("out = %q, want %q", b, want)
+	}
+
+	// adding a new key under the prefix appears with no template change
+	store["kg/web/new_thing"] = "fresh"
+	res, _ = RenderAutoOnce(cfg, list, fetch)
+	if !res.Changed {
+		t.Fatal("adding a key should change the render")
+	}
+	if b, _ := os.ReadFile(out); string(b) != "DB_PASSWORD=pw\nNEW_THING=fresh\nSENTRY_DSN=host-dsn\n" {
+		t.Fatalf("after add, out = %q", b)
+	}
+
+	// steady state: same store renders unchanged
+	res, _ = RenderAutoOnce(cfg, list, fetch)
+	if res.Changed {
+		t.Fatal("re-render with no changes should not be Changed")
+	}
+}
+
+func TestRenderAutoFallsBackToCache(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "o")
+	cache := filepath.Join(dir, "c")
+	cfg := AutoConfig{Prefix: "kg/web", Out: out, Cache: cache}
+
+	good := func() ([]string, error) { return []string{"kg/web/a"}, nil }
+	okFetch := func(string) (string, error) { return "v", nil }
+	if _, err := RenderAutoOnce(cfg, good, okFetch); err != nil {
+		t.Fatal(err)
+	}
+	// cluster unreachable -> serve last-good cache, no error
+	down := func() ([]string, error) { return nil, errors.New("down") }
+	res, err := RenderAutoOnce(cfg, down, okFetch)
+	if err != nil || !res.FellBack {
+		t.Fatalf("expected fallback, got %+v err=%v", res, err)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "A=v\n" {
+		t.Fatalf("out = %q", b)
+	}
+}
