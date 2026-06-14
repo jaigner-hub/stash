@@ -109,6 +109,10 @@ pass `-listen`/`-raft-port` to avoid collisions; across real boxes the defaults
 are fine. Restarting a node is just `stash server -data DIR -unseal-key key` —
 it recovers its identity/addresses from `cluster.json`.
 
+To ship a new build to the running cluster (build a static binary, rolling
+restart, per-node specifics for the systemd + NixOS boxes), see
+[docs/DEPLOY.md](docs/DEPLOY.md).
+
 **The join token carries the unseal key by default** so it's a single value to
 move. That makes the token as sensitive as the master key — prefer your tailnet,
 don't paste it into shared logs, and use `--no-key` for witnesses or any posture
