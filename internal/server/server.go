@@ -30,6 +30,38 @@ type Auditor interface {
 
 const maxBodyBytes = 1 << 20 // 1 MiB — secrets are small; cap abuse.
 
+// forwardedHeader marks a request that one node reverse-proxied to the leader,
+// so the leader records nothing for it (the edge node already audited it).
+const forwardedHeader = "X-Stash-Forwarded"
+
+// statusWriter captures the response status so the edge node can audit the
+// result of a request it forwarded to the leader.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// auditResult maps an HTTP status to an audit result string.
+func auditResult(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "ok"
+	case status == http.StatusForbidden:
+		return "denied"
+	case status == http.StatusNotFound:
+		return "not_found"
+	case status == http.StatusServiceUnavailable:
+		return "sealed"
+	default:
+		return "error"
+	}
+}
+
 // Backend is the cluster-aware store the server sits in front of. *cluster.Node
 // implements it; tests use a fake.
 type Backend interface {
@@ -223,13 +255,20 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.PathValue("path")
+	forwarded := r.Header.Get(forwardedHeader) != ""
 	if !id.Can(cluster.CapWrite, path) {
-		s.record(id, "write", path, "denied")
+		if !forwarded {
+			s.record(id, "write", path, "denied")
+		}
 		forbid(w)
 		return
 	}
+	// A follower forwards to the leader and audits the outcome itself (the edge
+	// node owns the audit entry); the leader skips recording forwarded requests.
 	if !s.backend.IsLeader() {
-		s.proxyToLeader(w, r) // the leader records the actual write
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		s.proxyToLeader(sw, r)
+		s.record(id, "write", path, auditResult(sw.status))
 		return
 	}
 	defer r.Body.Close()
@@ -244,11 +283,15 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.backend.Put(path, []byte(body.Value)); err != nil {
-		s.record(id, "write", path, "error")
+		if !forwarded {
+			s.record(id, "write", path, "error")
+		}
 		s.writeErr(w, err)
 		return
 	}
-	s.record(id, "write", path, "ok")
+	if !forwarded {
+		s.record(id, "write", path, "ok")
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -258,25 +301,34 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.PathValue("path")
+	forwarded := r.Header.Get(forwardedHeader) != ""
 	if !id.Can(cluster.CapDelete, path) {
-		s.record(id, "delete", path, "denied")
+		if !forwarded {
+			s.record(id, "delete", path, "denied")
+		}
 		forbid(w)
 		return
 	}
 	if !s.backend.IsLeader() {
-		s.proxyToLeader(w, r) // the leader records the actual delete
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		s.proxyToLeader(sw, r)
+		s.record(id, "delete", path, auditResult(sw.status))
 		return
 	}
 	if err := s.backend.Delete(path); err != nil {
-		result := "error"
-		if errors.Is(err, store.ErrNotFound) {
-			result = "not_found"
+		if !forwarded {
+			result := "error"
+			if errors.Is(err, store.ErrNotFound) {
+				result = "not_found"
+			}
+			s.record(id, "delete", path, result)
 		}
-		s.record(id, "delete", path, result)
 		s.writeErr(w, err)
 		return
 	}
-	s.record(id, "delete", path, "ok")
+	if !forwarded {
+		s.record(id, "delete", path, "ok")
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -473,6 +525,11 @@ func (s *server) proxyToLeader(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		req.Header.Set(forwardedHeader, "1") // tell the leader the edge already audited
+	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		s.log.Error("leader proxy failed", "err", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "leader unreachable"})
