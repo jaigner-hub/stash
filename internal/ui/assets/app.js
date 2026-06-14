@@ -80,7 +80,7 @@ function renderSecrets() {
       `<button data-act="edit">Edit</button> ` +
       `<button data-act="del" class="danger">Delete</button></td>`;
     tr.querySelector("[data-act=copy]").onclick = (e) => copySecret(p, e.currentTarget);
-    tr.querySelector("[data-act=reveal]").onclick = () => reveal(tr, p);
+    tr.querySelector("[data-act=reveal]").onclick = (e) => toggleReveal(tr, p, e.currentTarget);
     tr.querySelector("[data-act=edit]").onclick = () => editSecret(p);
     tr.querySelector("[data-act=del]").onclick = () => del(p);
     body.appendChild(tr);
@@ -143,22 +143,28 @@ function flash(btn, text) {
   }, 1200);
 }
 
-async function reveal(tr, path) {
+// toggleReveal flips a row between masked and shown, switching the button label
+// between "Reveal" and "Hide".
+async function toggleReveal(tr, path, btn) {
   const cell = tr.querySelector(".val");
+  if (btn.dataset.shown === "1") {
+    cell.innerHTML = '<span class="muted">••••••••</span>';
+    btn.textContent = "Reveal";
+    btn.dataset.shown = "";
+    return;
+  }
   const r = await fetch(pathURL(path));
   if (!r.ok) {
     cell.innerHTML = `<span class="err">${r.status === 503 ? "sealed" : "error " + r.status}</span>`;
     return;
   }
   const { value } = await r.json();
-  cell.innerHTML = "";
+  cell.textContent = "";
   const code = document.createElement("code");
   code.textContent = value;
-  const hide = document.createElement("button");
-  hide.textContent = "Hide";
-  hide.className = "link";
-  hide.onclick = () => { cell.innerHTML = '<span class="muted">••••••••</span>'; };
-  cell.append(code, " ", hide);
+  cell.appendChild(code);
+  btn.textContent = "Hide";
+  btn.dataset.shown = "1";
 }
 
 async function editSecret(path) {
