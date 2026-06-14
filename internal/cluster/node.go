@@ -202,6 +202,12 @@ func (n *Node) ListVersions(path string) ([]store.VersionMeta, error) {
 	return n.store.ListVersions(path)
 }
 
+// CurrentVersion returns the seq of the newest version of path (0 if none),
+// served locally. Used by the server to build a conditional-GET ETag.
+func (n *Node) CurrentVersion(path string) (uint64, error) {
+	return n.store.CurrentVersion(path)
+}
+
 // GetVersion returns the decrypted value of a specific version.
 func (n *Node) GetVersion(path string, seq uint64) ([]byte, error) {
 	blob, err := n.store.GetVersionRaw(path, seq)

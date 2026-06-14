@@ -18,6 +18,7 @@ import (
 type fakeBackend struct {
 	mu         sync.Mutex
 	data       map[string][]byte
+	versions   map[string]uint64 // path -> current version seq, bumped on Put
 	leader     bool
 	leaderURL  string
 	secret     string
@@ -26,7 +27,7 @@ type fakeBackend struct {
 }
 
 func newFake() *fakeBackend {
-	return &fakeBackend{data: map[string][]byte{}, leader: true, secret: "good-secret"}
+	return &fakeBackend{data: map[string][]byte{}, versions: map[string]uint64{}, leader: true, secret: "good-secret"}
 }
 
 func (f *fakeBackend) Get(p string) ([]byte, error) {
@@ -53,6 +54,7 @@ func (f *fakeBackend) Put(p string, v []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.data[p] = v
+	f.versions[p]++
 	return nil
 }
 
@@ -63,6 +65,7 @@ func (f *fakeBackend) Delete(p string) error {
 		return store.ErrNotFound
 	}
 	delete(f.data, p)
+	delete(f.versions, p)
 	return nil
 }
 
@@ -115,17 +118,31 @@ func (f *fakeBackend) ListIdentities() ([]cluster.Identity, error) {
 	return out, nil
 }
 func (f *fakeBackend) ListVersions(p string) ([]store.VersionMeta, error) {
-	if _, ok := f.data[p]; !ok {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur := f.versions[p]
+	if cur == 0 {
 		return nil, nil
 	}
-	return []store.VersionMeta{{Seq: 1, Time: "2026-01-01T00:00:00Z"}}, nil
+	var out []store.VersionMeta
+	for seq := cur; seq >= 1; seq-- {
+		out = append(out, store.VersionMeta{Seq: seq, Time: "2026-01-01T00:00:00Z"})
+	}
+	return out, nil
 }
 func (f *fakeBackend) GetVersion(p string, seq uint64) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	v, ok := f.data[p]
-	if !ok || seq != 1 {
+	if !ok || seq == 0 || seq > f.versions[p] {
 		return nil, store.ErrNotFound
 	}
 	return v, nil
+}
+func (f *fakeBackend) CurrentVersion(p string) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.versions[p], nil
 }
 func (f *fakeBackend) OutboundTLS() *tls.Config { return nil }
 

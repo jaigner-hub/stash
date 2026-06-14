@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -83,6 +84,7 @@ type Backend interface {
 	ListIdentities() ([]cluster.Identity, error)
 	ListVersions(path string) ([]store.VersionMeta, error)
 	GetVersion(path string, seq uint64) ([]byte, error)
+	CurrentVersion(path string) (uint64, error)
 	// OutboundTLS is the client TLS config for forwarding to the leader (nil for
 	// plaintext clusters).
 	OutboundTLS() *tls.Config
@@ -197,11 +199,19 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		forbid(w)
 		return
 	}
-	// Optional ?version=N reads a specific historical version.
+	// Optional ?version=N reads a specific historical version. A version is
+	// immutable, so it carries a strong ETag and revalidates trivially.
 	if vs := r.URL.Query().Get("version"); vs != "" {
 		seq, err := strconv.ParseUint(vs, 10, 64)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid version"})
+			return
+		}
+		etag := versionETag(seq)
+		if ifNoneMatch(r, etag) {
+			// Nothing is disclosed, so this is not an audited read.
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusNotModified)
 			return
 		}
 		v, err := s.backend.GetVersion(path, seq)
@@ -215,8 +225,23 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.record(id, "read", path, "ok")
+		w.Header().Set("ETag", etag)
 		writeJSON(w, http.StatusOK, secretBody{Value: string(v)})
 		return
+	}
+	// Conditional GET on the current value: the ETag is the current version seq.
+	// We resolve it before reading the value, so a write racing in between yields
+	// a stale ETag (one extra fetch next poll) rather than a missed update. A 304
+	// discloses nothing and is deliberately not audited — this is what keeps
+	// polling clients from flooding the audit log.
+	var etag string
+	if seq, err := s.backend.CurrentVersion(path); err == nil && seq != 0 {
+		etag = versionETag(seq)
+		if ifNoneMatch(r, etag) {
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 	}
 	v, err := s.backend.Get(path)
 	if err != nil {
@@ -229,7 +254,28 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.record(id, "read", path, "ok")
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+	}
 	writeJSON(w, http.StatusOK, secretBody{Value: string(v)})
+}
+
+// versionETag renders a strong ETag for a secret version seq.
+func versionETag(seq uint64) string { return fmt.Sprintf("\"v%d\"", seq) }
+
+// ifNoneMatch reports whether r's If-None-Match header matches etag (or "*").
+func ifNoneMatch(r *http.Request, etag string) bool {
+	h := r.Header.Get("If-None-Match")
+	if h == "" {
+		return false
+	}
+	for _, c := range strings.Split(h, ",") {
+		c = strings.TrimSpace(c)
+		if c == "*" || c == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) versions(w http.ResponseWriter, r *http.Request) {

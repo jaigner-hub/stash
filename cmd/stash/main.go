@@ -28,7 +28,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -459,34 +458,10 @@ func cmdAgent(args []string) error {
 	}
 
 	base := strings.TrimRight(*api, "/")
-	fetch := func(path string) (string, error) {
-		segs := strings.Split(path, "/")
-		for i, s := range segs {
-			segs[i] = url.PathEscape(s)
-		}
-		req, err := http.NewRequest(http.MethodGet, base+"/v1/secret/"+strings.Join(segs, "/"), nil)
-		if err != nil {
-			return "", err
-		}
-		if tok != "" {
-			req.Header.Set("Authorization", "Bearer "+tok)
-		}
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("fetch %s: status %d", path, resp.StatusCode)
-		}
-		var body struct {
-			Value string `json:"value"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			return "", err
-		}
-		return body.Value, nil
-	}
+	// The fetcher revalidates each secret with If-None-Match, so an unchanged
+	// secret comes back 304 — keeping the agent's steady poll out of the audit
+	// log (see secretClient).
+	fetch := newSecretClient(httpClient, base, tok).fetch
 
 	// list returns the secret paths this token may read (the server scopes it to
 	// the identity's ACL) — the set that -auto renders.
