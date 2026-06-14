@@ -24,6 +24,7 @@ type fakeBackend struct {
 	secret     string
 	identities map[string]*cluster.Identity // token -> identity (empty => open mode)
 	joined     *struct{ id, raft, http string }
+	status     *cluster.ClusterStatus // overrides Status() when set
 }
 
 func newFake() *fakeBackend {
@@ -80,6 +81,9 @@ func (f *fakeBackend) Join(id, raftAddr, httpAddr string) error {
 }
 func (f *fakeBackend) VerifyJoinSecret(s string) bool { return s == f.secret }
 func (f *fakeBackend) Status() cluster.ClusterStatus {
+	if f.status != nil {
+		return *f.status
+	}
 	return cluster.ClusterStatus{NodeID: "fake", IsLeader: f.leader}
 }
 

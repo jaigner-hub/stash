@@ -105,6 +105,7 @@ func New(b Backend, auditor Auditor, log *slog.Logger) http.Handler {
 	srv := &server{backend: b, audit: auditor, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", srv.health)
+	mux.HandleFunc("GET /metrics", srv.metrics)
 	mux.HandleFunc("GET /v1/secrets", srv.list)
 	mux.HandleFunc("GET /v1/secret/{path...}", srv.get)
 	mux.HandleFunc("GET /v1/versions/{path...}", srv.versions)
@@ -186,6 +187,47 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		"sealed":    s.backend.Sealed(),
 		"is_leader": s.backend.IsLeader(),
 	})
+}
+
+// metrics serves a tiny Prometheus exposition for cluster-health alerting. It is
+// dependency-free (no client_golang) and intentionally unauthenticated, like
+// /v1/health — it exposes only role/seal/leader/voter-count gauges, never secret
+// material or member addresses. Bare series (no node label): the scrape config
+// attaches instance/role. See keygrip observability (blackbox-stash + stash jobs).
+func (s *server) metrics(w http.ResponseWriter, r *http.Request) {
+	st := s.backend.Status()
+	voters := 0
+	for _, m := range st.Servers {
+		if m.Suffrage == "voter" {
+			voters++
+		}
+	}
+	bit := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, `# HELP stash_up 1 if the node is serving.
+# TYPE stash_up gauge
+stash_up 1
+# HELP stash_sealed 1 if the store is sealed (no DEK — cannot read secrets).
+# TYPE stash_sealed gauge
+stash_sealed %d
+# HELP stash_is_leader 1 if this node is the current raft leader.
+# TYPE stash_is_leader gauge
+stash_is_leader %d
+# HELP stash_raft_has_leader 1 if this node currently sees a raft leader.
+# TYPE stash_raft_has_leader gauge
+stash_raft_has_leader %d
+# HELP stash_raft_voters Number of voting members in the raft configuration.
+# TYPE stash_raft_voters gauge
+stash_raft_voters %d
+# HELP stash_raft_members Total members (voters + non-voters) in the raft configuration.
+# TYPE stash_raft_members gauge
+stash_raft_members %d
+`, bit(st.Sealed), bit(st.IsLeader), bit(st.LeaderID != ""), voters, len(st.Servers))
 }
 
 func (s *server) get(w http.ResponseWriter, r *http.Request) {
