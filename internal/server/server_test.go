@@ -5,28 +5,71 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"sync"
 	"testing"
 
-	"github.com/jaigner-hub/stash/internal/crypto"
 	"github.com/jaigner-hub/stash/internal/store"
 )
 
-func newTestServer(t *testing.T) http.Handler {
-	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "stash.db"))
-	if err != nil {
-		t.Fatal(err)
+// fakeBackend is an in-memory Backend for HTTP-layer tests. leader and leaderURL
+// are configurable to exercise forwarding.
+type fakeBackend struct {
+	mu        sync.Mutex
+	data      map[string][]byte
+	leader    bool
+	leaderURL string
+	joined    *struct{ id, raft, http string }
+}
+
+func newFake() *fakeBackend {
+	return &fakeBackend{data: map[string][]byte{}, leader: true}
+}
+
+func (f *fakeBackend) Get(p string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.data[p]
+	if !ok {
+		return nil, store.ErrNotFound
 	}
-	t.Cleanup(func() { s.Close() })
-	kek, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
+	return v, nil
+}
+
+func (f *fakeBackend) List() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for k := range f.data {
+		out = append(out, k)
 	}
-	if err := s.Init(kek); err != nil {
-		t.Fatal(err)
+	return out, nil
+}
+
+func (f *fakeBackend) Put(p string, v []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.data[p] = v
+	return nil
+}
+
+func (f *fakeBackend) Delete(p string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.data[p]; !ok {
+		return store.ErrNotFound
 	}
-	return New(s, nil)
+	delete(f.data, p)
+	return nil
+}
+
+func (f *fakeBackend) Sealed() bool   { return false }
+func (f *fakeBackend) IsLeader() bool { return f.leader }
+func (f *fakeBackend) LeaderHTTPAddr() (string, bool) {
+	return f.leaderURL, f.leaderURL != ""
+}
+func (f *fakeBackend) Join(id, raftAddr, httpAddr string) error {
+	f.joined = &struct{ id, raft, http string }{id, raftAddr, httpAddr}
+	return nil
 }
 
 func do(t *testing.T, h http.Handler, method, target string, body []byte) *httptest.ResponseRecorder {
@@ -43,7 +86,7 @@ func do(t *testing.T, h http.Handler, method, target string, body []byte) *httpt
 }
 
 func TestPutGetDeleteRoundTrip(t *testing.T) {
-	h := newTestServer(t)
+	h := New(newFake(), nil)
 	body, _ := json.Marshal(secretBody{Value: "hunter2"})
 
 	if rec := do(t, h, "PUT", "/v1/secret/kg/web/PW", body); rec.Code != http.StatusNoContent {
@@ -71,21 +114,21 @@ func TestPutGetDeleteRoundTrip(t *testing.T) {
 }
 
 func TestGetMissing(t *testing.T) {
-	h := newTestServer(t)
+	h := New(newFake(), nil)
 	if rec := do(t, h, "GET", "/v1/secret/nope", nil); rec.Code != http.StatusNotFound {
 		t.Fatalf("got %d", rec.Code)
 	}
 }
 
 func TestPutInvalidJSON(t *testing.T) {
-	h := newTestServer(t)
+	h := New(newFake(), nil)
 	if rec := do(t, h, "PUT", "/v1/secret/x", []byte("not json")); rec.Code != http.StatusBadRequest {
 		t.Fatalf("got %d", rec.Code)
 	}
 }
 
 func TestList(t *testing.T) {
-	h := newTestServer(t)
+	h := New(newFake(), nil)
 	for _, p := range []string{"a", "b"} {
 		body, _ := json.Marshal(secretBody{Value: "v"})
 		do(t, h, "PUT", "/v1/secret/"+p, body)
@@ -106,9 +149,60 @@ func TestList(t *testing.T) {
 }
 
 func TestHealth(t *testing.T) {
-	h := newTestServer(t)
+	h := New(newFake(), nil)
 	rec := do(t, h, "GET", "/v1/health", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+// TestWriteForwardsToLeader: a follower must reverse-proxy writes to the leader.
+func TestWriteForwardsToLeader(t *testing.T) {
+	// Stand up a "leader" HTTP server that records the forwarded write.
+	leader := newFake()
+	leaderSrv := httptest.NewServer(New(leader, nil))
+	defer leaderSrv.Close()
+
+	// Follower: not leader, points at the leader's URL.
+	follower := newFake()
+	follower.leader = false
+	follower.leaderURL = leaderSrv.URL
+	h := New(follower, nil)
+
+	body, _ := json.Marshal(secretBody{Value: "forwarded"})
+	rec := do(t, h, "PUT", "/v1/secret/foo", body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("forwarded PUT: got %d (%s)", rec.Code, rec.Body)
+	}
+	// The value should have landed on the leader, not the follower.
+	if v, err := leader.Get("foo"); err != nil || string(v) != "forwarded" {
+		t.Fatalf("leader.Get(foo) = %q, %v", v, err)
+	}
+	if _, err := follower.Get("foo"); err == nil {
+		t.Fatal("value unexpectedly written to follower")
+	}
+}
+
+func TestWriteNoLeader(t *testing.T) {
+	follower := newFake()
+	follower.leader = false // no leaderURL set => unknown
+	h := New(follower, nil)
+	body, _ := json.Marshal(secretBody{Value: "x"})
+	if rec := do(t, h, "PUT", "/v1/secret/foo", body); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d", rec.Code)
+	}
+}
+
+func TestJoin(t *testing.T) {
+	b := newFake()
+	h := New(b, nil)
+	body, _ := json.Marshal(map[string]string{
+		"node_id": "n2", "raft_addr": "127.0.0.1:8301", "http_addr": "http://127.0.0.1:8201",
+	})
+	if rec := do(t, h, "POST", "/v1/cluster/join", body); rec.Code != http.StatusOK {
+		t.Fatalf("got %d (%s)", rec.Code, rec.Body)
+	}
+	if b.joined == nil || b.joined.id != "n2" || b.joined.raft != "127.0.0.1:8301" {
+		t.Fatalf("join not recorded correctly: %+v", b.joined)
 	}
 }

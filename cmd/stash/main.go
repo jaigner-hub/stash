@@ -1,10 +1,22 @@
-// Command stash is a lightweight, single-binary secrets manager.
+// Command stash is a lightweight, single-binary, highly-available secrets
+// manager. State is replicated across nodes with embedded Raft.
 //
-// Milestone 1 is a single encrypted node — no clustering yet. Raft-based HA
-// lands in a later milestone behind the same store/server interfaces.
+//	stash init   [-unseal-key-out FILE]                 generate the cluster unseal key
+//	stash server -data DIR [-unseal-key FILE] ...        run a node
 //
-//	stash init   -data DIR [-unseal-key-out FILE]
-//	stash server -data DIR -unseal-key FILE [-listen ADDR]
+// Bring up a cluster:
+//
+//	# box 1 (bootstrap):
+//	stash server -data /data -unseal-key key -node-id n1 \
+//	    -listen 0.0.0.0:8200 -raft-addr 10.0.0.1:8300 \
+//	    -advertise-http http://10.0.0.1:8200 -bootstrap
+//	# box 2 (join):
+//	stash server -data /data -unseal-key key -node-id n2 \
+//	    -listen 0.0.0.0:8200 -raft-addr 10.0.0.2:8300 \
+//	    -advertise-http http://10.0.0.2:8200 -join http://10.0.0.1:8200
+//	# witness (no key -> sealed voter, quorum only):
+//	stash server -data /data -node-id w -raft-addr 10.0.0.3:8300 \
+//	    -advertise-http http://10.0.0.3:8200 -join http://10.0.0.1:8200
 package main
 
 import (
@@ -22,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/crypto"
 	"github.com/jaigner-hub/stash/internal/server"
 	"github.com/jaigner-hub/stash/internal/store"
@@ -53,11 +66,11 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `stash — lightweight secrets manager
+	fmt.Fprint(os.Stderr, `stash — lightweight HA secrets manager
 
 usage:
-  stash init   -data DIR [-unseal-key-out FILE]   initialize a new store
-  stash server -data DIR -unseal-key FILE [-listen ADDR]   run the node
+  stash init   [-unseal-key-out FILE]            generate the cluster unseal key
+  stash server -data DIR [flags]                 run a node
 
 run "stash <command> -h" for command flags.
 `)
@@ -65,35 +78,18 @@ run "stash <command> -h" for command flags.
 
 func dbPath(dir string) string { return filepath.Join(dir, "stash.db") }
 
+// cmdInit generates a fresh unseal key (KEK). The data key is created later, on
+// cluster bootstrap, wrapped under this KEK. The KEK is the only secret you keep
+// in SOPS/your bootstrap blob.
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	dir := fs.String("data", "./data", "data directory for the bbolt database")
-	keyOut := fs.String("unseal-key-out", "", "write the generated unseal key here (default: print to stdout)")
+	keyOut := fs.String("unseal-key-out", "", "write the generated unseal key here (default: stdout)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	if err := os.MkdirAll(*dir, 0o700); err != nil {
-		return fmt.Errorf("create data dir: %w", err)
-	}
-	s, err := store.Open(dbPath(*dir))
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-
-	switch init, err := s.Initialized(); {
-	case err != nil:
-		return err
-	case init:
-		return errors.New("store already initialized (refusing to overwrite)")
-	}
-
 	kek, err := crypto.GenerateKey()
 	if err != nil {
-		return err
-	}
-	if err := s.Init(kek); err != nil {
 		return err
 	}
 	encoded := base64.StdEncoding.EncodeToString(kek)
@@ -102,46 +98,101 @@ func cmdInit(args []string) error {
 		"store it in SOPS/your bootstrap blob, never commit it"
 	if *keyOut == "" {
 		fmt.Printf("unseal key (base64): %s\n", encoded)
-		fmt.Fprintf(os.Stderr, "\nWARNING: %s.\nIt was NOT written to disk; copy it now.\n", warn)
+		fmt.Fprintf(os.Stderr, "\nWARNING: %s.\n", warn)
 		return nil
 	}
 	if err := os.WriteFile(*keyOut, []byte(encoded+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write unseal key: %w", err)
 	}
-	fmt.Printf("initialized %s\nunseal key written to %s (0600)\n", dbPath(*dir), *keyOut)
+	fmt.Printf("unseal key written to %s (0600)\n", *keyOut)
 	fmt.Fprintf(os.Stderr, "\nWARNING: %s.\n", warn)
 	return nil
 }
 
 func cmdServer(args []string) error {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	dir := fs.String("data", "./data", "data directory for the bbolt database")
-	keyFile := fs.String("unseal-key", "", "file containing the base64 unseal key (required)")
-	listen := fs.String("listen", "127.0.0.1:8200", "HTTP listen address")
+	dir := fs.String("data", "./data", "data directory (raft logs, snapshots, store db)")
+	keyFile := fs.String("unseal-key", "", "base64 unseal key file; omit to run as a sealed witness")
+	listen := fs.String("listen", "127.0.0.1:8200", "HTTP API listen address")
+	nodeID := fs.String("node-id", "node1", "unique stable node id")
+	raftAddr := fs.String("raft-addr", "127.0.0.1:8300", "host:port for the raft transport")
+	advertise := fs.String("advertise-http", "", "API URL other nodes use to reach this node (default: http://<listen>)")
+	bootstrap := fs.Bool("bootstrap", false, "form a new cluster (first node only)")
+	join := fs.String("join", "", "API URL of an existing node to join")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *keyFile == "" {
-		return errors.New("-unseal-key is required")
-	}
-	kek, err := readKey(*keyFile)
-	if err != nil {
-		return err
+
+	if err := os.MkdirAll(*dir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	s, err := store.Open(dbPath(*dir))
+	var kek []byte
+	if *keyFile != "" {
+		var err error
+		if kek, err = readKey(*keyFile); err != nil {
+			return err
+		}
+	}
+
+	st, err := store.Open(dbPath(*dir))
 	if err != nil {
 		return err
 	}
-	defer s.Close()
-	if err := s.Unseal(kek); err != nil {
+	defer st.Close()
+
+	httpAdvertise := *advertise
+	if httpAdvertise == "" {
+		httpAdvertise = "http://" + *listen
+	}
+	node, err := cluster.New(cluster.Config{
+		NodeID:    *nodeID,
+		RaftAddr:  *raftAddr,
+		HTTPAddr:  httpAdvertise,
+		DataDir:   *dir,
+		Bootstrap: *bootstrap,
+	}, st)
+	if err != nil {
 		return err
 	}
+	defer node.Close()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	if *bootstrap {
+		if kek == nil {
+			return errors.New("-unseal-key is required when bootstrapping (it creates the data key)")
+		}
+		if err := node.Initialize(kek, 15*time.Second); err != nil {
+			return fmt.Errorf("bootstrap init: %w", err)
+		}
+		log.Info("bootstrapped cluster", "node", *nodeID)
+	}
+	if *join != "" {
+		if err := cluster.RequestJoin(*join, *nodeID, *raftAddr, httpAdvertise); err != nil {
+			return fmt.Errorf("join %s: %w", *join, err)
+		}
+		log.Info("requested join", "leader", *join, "node", *nodeID)
+	}
+
+	// Unseal in the background so the node can serve (sealed) immediately and
+	// flip to unsealed once the init material has replicated. Without a key the
+	// node stays a sealed witness: consensus only.
+	if kek != nil {
+		go func() {
+			if err := node.Unseal(kek, 60*time.Second); err != nil {
+				log.Error("unseal failed", "err", err)
+			} else {
+				log.Info("store unsealed")
+			}
+		}()
+	} else {
+		log.Warn("no unseal key — running as a sealed witness (consensus only, cannot read secrets)")
+	}
+
 	httpSrv := &http.Server{
 		Addr:         *listen,
-		Handler:      server.New(s, log),
+		Handler:      server.New(node, log),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -151,7 +202,7 @@ func cmdServer(args []string) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("stash listening", "addr", *listen)
+		log.Info("stash listening", "addr", *listen, "raft", *raftAddr, "node", *nodeID)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}

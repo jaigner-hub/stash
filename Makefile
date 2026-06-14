@@ -17,10 +17,10 @@ fmt:
 tidy:
 	go mod tidy
 
-# Init a throwaway store and run the node against it (Ctrl-C to stop).
+# Generate a key and run a throwaway single-node cluster (Ctrl-C to stop).
 run-demo: build
-	./$(BINARY) init -data ./data -unseal-key-out ./unseal-key
-	./$(BINARY) server -data ./data -unseal-key ./unseal-key
+	./$(BINARY) init -unseal-key-out ./unseal-key
+	./$(BINARY) server -data ./data -unseal-key ./unseal-key -bootstrap
 
 clean:
 	rm -f $(BINARY) unseal-key
