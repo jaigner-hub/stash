@@ -82,6 +82,14 @@ button.link { background: transparent; border: none; color: var(--accent); paddi
 .msg.ok { color: var(--ok); }
 .msg.err, .err { color: var(--danger); }
 
+.anchor-detail {
+  margin: 0 0 14px; padding: 10px 13px; font-size: 13px; line-height: 1.5;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+}
+.anchor-detail p { margin: 3px 0; }
+.anchor-detail .ok { color: var(--ok); }
+.anchor-detail b { color: var(--text); font-weight: 600; }
+
 /* login overlay */
 .login-overlay {
   position: fixed; inset: 0; z-index: 100;

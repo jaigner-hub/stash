@@ -390,6 +390,7 @@ $("#identity-form").addEventListener("submit", async (e) => {
 
 const AUDIT_PAGE = 25;
 let auditOldest = 0; // seq of the oldest row currently shown
+let auditData = null; // last response's verification summary, for the detail panel
 
 async function loadAudit(reset) {
   const before = reset ? 0 : auditOldest;
@@ -400,10 +401,23 @@ async function loadAudit(reset) {
   }
   const data = await r.json();
   $("#audit-card").hidden = false;
+  auditData = { verified: data.verified, count: data.count, anchors: data.anchors };
+
   const badge = $("#audit-status");
   badge.textContent =
     (data.verified ? "chain intact ✓" : "chain BROKEN ✗") + " · " + (data.count || 0) + " entries";
   badge.className = "badge " + (data.verified ? "ok" : "warn");
+
+  const a = data.anchors;
+  const anchor = $("#anchor-status");
+  if (!a || !a.count) {
+    anchor.textContent = "no timestamps yet";
+    anchor.className = "badge";
+  } else {
+    anchor.textContent = (a.verified ? "timestamps ✓ · " : "timestamps ✗ · ") + a.count;
+    anchor.className = "badge " + (a.verified ? "ok" : "warn");
+  }
+  if (!$("#anchor-detail").hidden) renderVerifyDetail();
 
   const body = tbody("#audit");
   if (reset) {
@@ -414,6 +428,42 @@ async function loadAudit(reset) {
   entries.forEach((e) => body.appendChild(auditRow(e)));
   if (entries.length) auditOldest = entries[entries.length - 1].seq;
   $("#audit-more").hidden = !(entries.length === AUDIT_PAGE && auditOldest > 1);
+}
+
+function fmtTime(t) {
+  return (t || "").replace("T", " ").replace(/\.\d+/, "").replace("Z", " UTC");
+}
+
+// renderVerifyDetail explains the live verification: the per-entry hash chain +
+// signatures, and the RFC 3161 timestamp anchors (which prove the log can't be
+// silently backdated, even by a key holder).
+function renderVerifyDetail() {
+  const d = auditData || {};
+  const a = d.anchors || {};
+  const lines = [];
+  lines.push(
+    d.verified
+      ? `Chain: <span class="ok">intact ✓</span> over ${d.count || 0} entries — every entry hash-chained and Ed25519-signed.`
+      : `Chain: <span class="err">BROKEN ✗</span> over ${d.count || 0} entries — tampering detected.`
+  );
+  if (!a.count) {
+    lines.push(
+      `Timestamps: <span class="muted">no anchors recorded yet</span>. The chain head is anchored to the timestamp authority on a schedule; the newest entries are covered at the next anchor.`
+    );
+  } else if (a.verified) {
+    lines.push(`Timestamps: <span class="ok">all ${a.count} anchors verified ✓</span> against the system trust roots (RFC 3161).`);
+    if (a.proven_by)
+      lines.push(
+        `Proven: the log through seq <b>${a.proven_through_seq}</b> existed no later than <b>${esc(fmtTime(a.proven_by))}</b> — not even a key holder can backdate it.`
+      );
+  } else {
+    const fails = a.failures || [];
+    lines.push(`Timestamps: <span class="err">${fails.length} of ${a.count} anchors FAILED ✗</span>.`);
+    fails.forEach((f) => lines.push(`<span class="err">seq ${esc(String(f.head_seq))}: ${esc(f.err || "")}</span>`));
+    if (a.proven_by)
+      lines.push(`Last good anchor: through seq <b>${a.proven_through_seq}</b> by <b>${esc(fmtTime(a.proven_by))}</b>.`);
+  }
+  $("#anchor-detail").innerHTML = lines.map((l) => `<p>${l}</p>`).join("");
 }
 
 function auditRow(e) {
@@ -431,6 +481,16 @@ function auditRow(e) {
 
 $("#audit-refresh").onclick = () => loadAudit(true);
 $("#audit-more").onclick = () => loadAudit(false);
+$("#audit-verify").onclick = async () => {
+  const detail = $("#anchor-detail");
+  if (!detail.hidden) {
+    detail.hidden = true; // toggle off
+    return;
+  }
+  await loadAudit(true); // force a fresh server-side verification
+  renderVerifyDetail();
+  detail.hidden = false;
+};
 
 // ---------- boot ----------
 

@@ -89,9 +89,12 @@
         <h2>Audit log</h2>
         <span>
           <span id="audit-status" class="badge"></span>
+          <span id="anchor-status" class="badge"></span>
+          <button id="audit-verify" class="ghost">Verify timestamps</button>
           <button id="audit-refresh" class="ghost">Refresh</button>
         </span>
       </div>
+      <div id="anchor-detail" class="anchor-detail" hidden></div>
       <table id="audit">
         <thead><tr><th>Time (UTC)</th><th>Identity</th><th>Action</th><th>Path</th><th>Result</th></tr></thead>
         <tbody></tbody>
