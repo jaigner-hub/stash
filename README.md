@@ -24,6 +24,38 @@ On a small, capacity-constrained box pair you want something that:
 
 ## Architecture
 
+### The whole picture
+
+Each app box runs its own local `stash` node *and* a `stash agent`. The agent
+polls the local node and renders the secrets it may read into a tmpfs env file;
+the app just sources that file. Reads are served locally; writes are forwarded to
+the leader; a sealed witness provides the third Raft vote without ever being able
+to read a secret.
+
+```mermaid
+flowchart TB
+    subgraph b1["app box · vent.dog"]
+        w1["keygrip-web"] -->|source| e1["web.env<br/>tmpfs · 0600"]
+        a1["stash agent"] -->|render KEY=value| e1
+        a1 -->|"poll: GET /v1/secret/*<br/>(If-None-Match)"| s1["stash node<br/>keyed · leader"]
+    end
+
+    subgraph b2["app box · vent.dog2"]
+        w2["keygrip-web"] -->|source| e2["web.env<br/>tmpfs · 0600"]
+        a2["stash agent"] -->|render KEY=value| e2
+        a2 -->|"poll (If-None-Match)"| s2["stash node<br/>keyed"]
+    end
+
+    wit["witness · monitor<br/>sealed · vote-only<br/>holds ciphertext, never reads"]
+
+    s1 <==>|"raft · mTLS<br/>replicate ciphertext"| s2
+    s1 <==> wit
+    s2 <==> wit
+    s2 -.->|"writes forwarded to leader"| s1
+
+    admin["Web UI · CLI · curl"] -->|"HTTPS + bearer token"| s1
+```
+
 ### Envelope encryption
 
 ```
@@ -61,6 +93,41 @@ but is cryptographically unable to read plaintext.
 Writes are accepted only on the leader — a follower transparently reverse-proxies
 write requests to the current leader. Reads are served locally (a follower may be
 slightly stale).
+
+### Conditional reads & the audit log
+
+Every node keeps its own hash-chained, append-only audit log. A read that
+discloses a secret is recorded — which means a polling client (the agent,
+keygrip-web) that re-fetches every key on a fixed interval would flood the log
+with churn for data that never changed.
+
+`stash` fixes that at the disclosure boundary, not by dropping read auditing: a
+secret read carries a strong `ETag` (its current version), and the client
+revalidates with `If-None-Match`. An unchanged secret comes back `304` — no body
+on the wire, and **no audit row, because nothing was disclosed**. Only an actual
+disclosure (first read, or after a write bumps the version) is recorded.
+
+```mermaid
+sequenceDiagram
+    participant A as stash agent
+    participant S as stash node
+    participant L as audit log
+
+    Note over A,S: first poll (or after a change)
+    A->>S: GET /v1/secret/kg/web/DB_PW
+    S->>L: record read = ok
+    S-->>A: 200 {value} · ETag "v7"
+
+    Note over A,S: steady polls — nothing changed
+    A->>S: GET … If-None-Match "v7"
+    S-->>A: 304 Not Modified
+    Note right of S: no body · no audit row
+
+    Note over A,S: a write bumps the version
+    A->>S: GET … If-None-Match "v7"
+    S->>L: record read = ok
+    S-->>A: 200 {value} · ETag "v8"
+```
 
 ### Packages
 
@@ -108,6 +175,10 @@ route to the leader), so you don't type IPs or ports. On the same host (demo),
 pass `-listen`/`-raft-port` to avoid collisions; across real boxes the defaults
 are fine. Restarting a node is just `stash server -data DIR -unseal-key key` —
 it recovers its identity/addresses from `cluster.json`.
+
+To ship a new build to the running cluster (build a static binary, rolling
+restart, per-node specifics for the systemd + NixOS boxes), see
+[docs/DEPLOY.md](docs/DEPLOY.md).
 
 **The join token carries the unseal key by default** so it's a single value to
 move. That makes the token as sensitive as the master key — prefer your tailnet,

@@ -28,7 +28,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -46,6 +45,10 @@ import (
 	"github.com/jaigner-hub/stash/internal/store"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=...". It stays
+// "dev" for a plain `go build`. See the Makefile / docs/DEPLOY.md.
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -53,6 +56,9 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "version", "-v", "--version":
+		fmt.Printf("stash %s\n", version)
+		return
 	case "init":
 		err = cmdInit(os.Args[2:])
 	case "server":
@@ -88,6 +94,7 @@ usage:
   stash token  [--no-key] [flags]          mint another join token
   stash agent  -auto -prefix P -out O      render every readable secret to a file (KEY=value)
   stash agent  -template T -out O [flags]   render secrets via a template (last-good cache)
+  stash version                            print the build version
 
 run "stash <command> -h" for command flags.
 `)
@@ -459,34 +466,10 @@ func cmdAgent(args []string) error {
 	}
 
 	base := strings.TrimRight(*api, "/")
-	fetch := func(path string) (string, error) {
-		segs := strings.Split(path, "/")
-		for i, s := range segs {
-			segs[i] = url.PathEscape(s)
-		}
-		req, err := http.NewRequest(http.MethodGet, base+"/v1/secret/"+strings.Join(segs, "/"), nil)
-		if err != nil {
-			return "", err
-		}
-		if tok != "" {
-			req.Header.Set("Authorization", "Bearer "+tok)
-		}
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("fetch %s: status %d", path, resp.StatusCode)
-		}
-		var body struct {
-			Value string `json:"value"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			return "", err
-		}
-		return body.Value, nil
-	}
+	// The fetcher revalidates each secret with If-None-Match, so an unchanged
+	// secret comes back 304 — keeping the agent's steady poll out of the audit
+	// log (see secretClient).
+	fetch := newSecretClient(httpClient, base, tok).fetch
 
 	// list returns the secret paths this token may read (the server scopes it to
 	// the identity's ACL) — the set that -auto renders.

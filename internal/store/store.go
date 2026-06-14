@@ -298,6 +298,24 @@ func (s *Store) ListVersions(path string) ([]VersionMeta, error) {
 	return out, nil
 }
 
+// CurrentVersion returns the seq of the newest version of path, or 0 if path
+// has no versions. It reads only version keys (no record unmarshal, no decrypt),
+// so it is cheap enough to call on every read for conditional-GET validation.
+func (s *Store) CurrentVersion(path string) (uint64, error) {
+	pfx := versionPrefix(path)
+	var max uint64
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(versionsBucket).Cursor()
+		for k, _ := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, _ = c.Next() {
+			if seq := binary.BigEndian.Uint64(k[len(pfx):]); seq > max {
+				max = seq
+			}
+		}
+		return nil
+	})
+	return max, err
+}
+
 // GetVersionRaw returns the stored ciphertext for a specific version.
 func (s *Store) GetVersionRaw(path string, seq uint64) ([]byte, error) {
 	var blob []byte
