@@ -4,7 +4,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -441,8 +444,32 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 			visible = append(visible, k)
 		}
 	}
+	sort.Strings(visible) // deterministic order so the ETag is stable
+	// The ETag is the visible key SET (names only): it changes when a key is added
+	// or removed, not when a value changes (values come via per-secret reads). A
+	// matching If-None-Match means the set is unchanged → 304, and not audited,
+	// since no listing was disclosed. Per-identity, since `visible` is ACL-scoped —
+	// this is what keeps a polling agent's `list` call out of the audit log too.
+	etag := listETag(visible)
+	if ifNoneMatch(r, etag) {
+		w.Header().Set("ETag", etag)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	s.record(id, "list", "", "ok")
+	w.Header().Set("ETag", etag)
 	writeJSON(w, http.StatusOK, map[string]any{"keys": visible})
+}
+
+// listETag hashes the (sorted) visible key set into a strong ETag. Only the names
+// matter — a value change doesn't alter the listing.
+func listETag(keys []string) string {
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0}) // delimiter so ["ab","c"] != ["a","bc"]
+	}
+	return fmt.Sprintf("\"l%s\"", hex.EncodeToString(h.Sum(nil)[:8]))
 }
 
 func (s *server) join(w http.ResponseWriter, r *http.Request) {
