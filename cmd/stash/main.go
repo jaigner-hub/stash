@@ -45,6 +45,10 @@ import (
 	"github.com/jaigner-hub/stash/internal/store"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=...". It stays
+// "dev" for a plain `go build`. See the Makefile / docs/DEPLOY.md.
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -52,6 +56,9 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "version", "-v", "--version":
+		fmt.Printf("stash %s\n", version)
+		return
 	case "init":
 		err = cmdInit(os.Args[2:])
 	case "server":
@@ -87,6 +94,7 @@ usage:
   stash token  [--no-key] [flags]          mint another join token
   stash agent  -auto -prefix P -out O      render every readable secret to a file (KEY=value)
   stash agent  -template T -out O [flags]   render secrets via a template (last-good cache)
+  stash version                            print the build version
 
 run "stash <command> -h" for command flags.
 `)

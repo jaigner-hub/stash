@@ -35,18 +35,19 @@ Build **one static binary** and use it on all three nodes. The default
 `CGO_ENABLED=0` produces a portable static ELF that runs everywhere.
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o stash ./cmd/stash
+make release        # CGO_ENABLED=0, -trimpath, version stamped from git describe
 file stash          # ... statically linked ...
-sha256sum stash     # record this — it's how you verify each node post-rollout
+./stash version     # stash v… — confirms the stamp
+sha256sum stash     # record this too
 go test ./...       # green before you ship
 ```
 
 All three nodes are `linux/amd64`. If `monitor`'s arch ever differs, rebuild with
 the matching `GOARCH` for that node.
 
-There is no `stash version` command, so **sha256 is the source of truth** for
-"did the new binary land": compare `sha256sum` on each node to the artifact you
-built.
+Verify a rollout two ways: `stash version` on each node should print the build you
+shipped, and `sha256sum` should match the artifact. (`stash version` works even on
+the sealed witness, which can't serve an API read.)
 
 ## Rollout
 
@@ -99,7 +100,8 @@ the module.)
 
 ## Verify
 
-1. **Binary landed** — `sha256sum` on each node matches the artifact.
+1. **Binary landed** — `stash version` on each node prints the shipped build (and
+   `sha256sum` matches the artifact).
 2. **Conditional GET is live** (keyed nodes only — the witness is sealed):
 
    ```sh
