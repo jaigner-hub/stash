@@ -88,6 +88,9 @@ button.link { background: transparent; border: none; color: var(--accent); paddi
   background: rgba(8, 10, 14, 0.85);
   display: flex; align-items: center; justify-content: center;
 }
+/* The attribute selector outranks .login-overlay's display:flex, so the
+   hidden attribute actually hides the overlay. */
+.login-overlay[hidden] { display: none; }
 .login-card { width: 360px; max-width: 90vw; }
 .login-card h2 { color: var(--text); text-transform: none; letter-spacing: 0; font-size: 18px; }
 .login-card input { margin-bottom: 12px; }
