@@ -75,14 +75,72 @@ function renderSecrets() {
       `<td class="path">${esc(p)}</td>` +
       `<td class="val"><span class="muted">••••••••</span></td>` +
       `<td class="row-actions">` +
+      `<button data-act="copy">Copy</button> ` +
       `<button data-act="reveal">Reveal</button> ` +
       `<button data-act="edit">Edit</button> ` +
       `<button data-act="del" class="danger">Delete</button></td>`;
+    tr.querySelector("[data-act=copy]").onclick = (e) => copySecret(p, e.currentTarget);
     tr.querySelector("[data-act=reveal]").onclick = () => reveal(tr, p);
     tr.querySelector("[data-act=edit]").onclick = () => editSecret(p);
     tr.querySelector("[data-act=del]").onclick = () => del(p);
     body.appendChild(tr);
   });
+}
+
+// copySecret fetches a value and copies it to the clipboard WITHOUT rendering
+// it on screen — the safer default for shoulder-surfing / screen-sharing.
+async function copySecret(path, btn) {
+  const r = await fetch(pathURL(path));
+  if (!r.ok) {
+    flash(btn, r.status === 503 ? "sealed" : "error");
+    return;
+  }
+  const { value } = await r.json();
+  copyValue(value, btn);
+}
+
+async function copyValue(value, btn) {
+  flash(btn, (await copyText(value)) ? "Copied!" : "copy failed");
+}
+
+// copyText prefers the async Clipboard API (needs a secure context: https or
+// localhost) and falls back to an off-screen textarea for plain-HTTP access
+// over a LAN/tailnet IP. The value is never shown to the user either way.
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      /* fall through to legacy path */
+    }
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+// flash briefly replaces a button's label with feedback, then restores it.
+function flash(btn, text) {
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.textContent = text;
+  btn.disabled = true;
+  setTimeout(() => {
+    btn.textContent = btn.dataset.label;
+    btn.disabled = false;
+  }, 1200);
 }
 
 async function reveal(tr, path) {
@@ -99,7 +157,7 @@ async function reveal(tr, path) {
   const copy = document.createElement("button");
   copy.textContent = "Copy";
   copy.className = "link";
-  copy.onclick = () => navigator.clipboard && navigator.clipboard.writeText(value);
+  copy.onclick = (e) => copyValue(value, e.currentTarget);
   const hide = document.createElement("button");
   hide.textContent = "Hide";
   hide.className = "link";
