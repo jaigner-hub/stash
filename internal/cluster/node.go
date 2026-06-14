@@ -190,6 +190,13 @@ func (n *Node) Sealed() bool { return n.store.Sealed() }
 // Put encrypts value locally then replicates the ciphertext via Raft. Must be
 // called on the leader (the server forwards otherwise).
 func (n *Node) Put(path string, value []byte) error {
+	// Idempotent write: if the stored value is byte-identical, skip — don't churn
+	// an identical new version. Envelope encryption re-nonces every write, so the
+	// ciphertext always differs; dedup has to compare decrypted plaintext. A
+	// missing path (ErrNotFound) or any read error falls through to a normal write.
+	if cur, err := n.store.Get(path); err == nil && bytes.Equal(cur, value) {
+		return nil
+	}
 	blob, err := n.store.Encrypt(path, value) // requires unseal
 	if err != nil {
 		return err

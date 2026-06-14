@@ -135,6 +135,42 @@ func TestNodeVersioning(t *testing.T) {
 	}
 }
 
+// Re-writing the same value is idempotent: it must not create a new version
+// (envelope encryption re-nonces every write, so the dedup compares plaintext).
+func TestNodePutIsIdempotent(t *testing.T) {
+	kek := mustKey(t)
+	n, _, _ := newNode(t, "n1", true)
+	if _, err := n.Initialize(kek, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Unseal(kek, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Put("p", []byte("same")); err != nil {
+		t.Fatal(err)
+	}
+	// Three redundant writes of the identical value.
+	for i := 0; i < 3; i++ {
+		if err := n.Put("p", []byte("same")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vers, err := n.ListVersions("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vers) != 1 {
+		t.Fatalf("redundant writes must not churn versions; want 1, got %d", len(vers))
+	}
+	// A genuine change still creates a version.
+	if err := n.Put("p", []byte("changed")); err != nil {
+		t.Fatal(err)
+	}
+	if vers, _ = n.ListVersions("p"); len(vers) != 2 {
+		t.Fatalf("a real change should add a version; want 2, got %d", len(vers))
+	}
+}
+
 func TestThreeNodeReplication(t *testing.T) {
 	kek := mustKey(t)
 	n1, _, h1 := newNode(t, "n1", true)
