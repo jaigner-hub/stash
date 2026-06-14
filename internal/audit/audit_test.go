@@ -134,3 +134,34 @@ func TestTamperBreaksChain(t *testing.T) {
 		t.Fatal("tampering should break the chain")
 	}
 }
+
+func TestStreamSinkReceivesEntries(t *testing.T) {
+	l, _ := newLog(t)
+	var got []Entry
+	l.Stream(func(e Entry) { got = append(got, e) })
+
+	if err := l.Record("alice", "read", "kg/web/A", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Record("bob", "write", "kg/web/B", "denied"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("sink got %d entries, want 2", len(got))
+	}
+	// The sink sees the fully-formed, persisted entry (seq, node, hash chained).
+	if got[0].Seq != 1 || got[0].Identity != "alice" || got[0].Hash == "" {
+		t.Fatalf("entry 0 malformed: %+v", got[0])
+	}
+	if got[1].Seq != 2 || got[1].PrevHash != got[0].Hash {
+		t.Fatalf("entry 1 not chained: prev=%s want=%s", got[1].PrevHash, got[0].Hash)
+	}
+	// Disabling the sink stops delivery.
+	l.Stream(nil)
+	if err := l.Record("carol", "list", "", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("sink still received after nil: %d", len(got))
+	}
+}
