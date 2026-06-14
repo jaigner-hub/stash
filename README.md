@@ -107,6 +107,11 @@ revalidates with `If-None-Match`. An unchanged secret comes back `304` — no bo
 on the wire, and **no audit row, because nothing was disclosed**. Only an actual
 disclosure (first read, or after a write bumps the version) is recorded.
 
+The same applies to the key listing (`GET /v1/secrets`): its `ETag` is the
+visible key *set*, so a poll that finds no keys added or removed `304`s and isn't
+audited either. With both, a steady `-auto` poll where nothing changed (one
+listing + N reads) writes **zero** audit entries.
+
 ```mermaid
 sequenceDiagram
     participant A as stash agent

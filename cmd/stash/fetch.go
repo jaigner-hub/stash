@@ -19,8 +19,10 @@ type secretClient struct {
 	base  string // trimmed API base URL
 	token string // bearer token; empty in open mode
 
-	mu     sync.Mutex
-	cached map[string]cachedSecret
+	mu       sync.Mutex
+	cached   map[string]cachedSecret
+	listEtag string   // ETag of the last 200 from /v1/secrets
+	listKeys []string // keys from that 200, reused on a 304
 }
 
 type cachedSecret struct {
@@ -80,5 +82,53 @@ func (s *secretClient) fetch(path string) (string, error) {
 		return body.Value, nil
 	default:
 		return "", fmt.Errorf("fetch %s: status %d", path, resp.StatusCode)
+	}
+}
+
+// list returns the secret paths this token may read (an agent.Lister). It
+// revalidates with If-None-Match so an unchanged key set comes back 304 — reusing
+// the cached list and keeping the agent's per-poll `list` call out of the audit
+// log. The ETag tracks the key SET, so a value change still triggers a fresh fetch
+// of that secret (via fetch), just not a re-list.
+func (s *secretClient) list() ([]string, error) {
+	req, err := http.NewRequest(http.MethodGet, s.base+"/v1/secrets", nil)
+	if err != nil {
+		return nil, err
+	}
+	if s.token != "" {
+		req.Header.Set("Authorization", "Bearer "+s.token)
+	}
+	s.mu.Lock()
+	prevEtag, prevKeys := s.listEtag, s.listKeys
+	s.mu.Unlock()
+	if prevEtag != "" {
+		req.Header.Set("If-None-Match", prevEtag)
+	}
+
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNotModified:
+		if prevEtag == "" {
+			return nil, fmt.Errorf("list secrets: 304 with no cached list")
+		}
+		return prevKeys, nil
+	case http.StatusOK:
+		var body struct {
+			Keys []string `json:"keys"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		s.listEtag, s.listKeys = resp.Header.Get("ETag"), body.Keys
+		s.mu.Unlock()
+		return body.Keys, nil
+	default:
+		return nil, fmt.Errorf("list secrets: status %d", resp.StatusCode)
 	}
 }

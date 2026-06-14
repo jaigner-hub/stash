@@ -21,7 +21,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -466,37 +465,12 @@ func cmdAgent(args []string) error {
 	}
 
 	base := strings.TrimRight(*api, "/")
-	// The fetcher revalidates each secret with If-None-Match, so an unchanged
-	// secret comes back 304 — keeping the agent's steady poll out of the audit
-	// log (see secretClient).
-	fetch := newSecretClient(httpClient, base, tok).fetch
-
-	// list returns the secret paths this token may read (the server scopes it to
-	// the identity's ACL) — the set that -auto renders.
-	list := func() ([]string, error) {
-		req, err := http.NewRequest(http.MethodGet, base+"/v1/secrets", nil)
-		if err != nil {
-			return nil, err
-		}
-		if tok != "" {
-			req.Header.Set("Authorization", "Bearer "+tok)
-		}
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("list secrets: status %d", resp.StatusCode)
-		}
-		var body struct {
-			Keys []string `json:"keys"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			return nil, err
-		}
-		return body.Keys, nil
-	}
+	// Both the per-secret fetch and the -auto key listing revalidate with
+	// If-None-Match, so an unchanged secret/key-set comes back 304 — keeping the
+	// agent's steady poll entirely out of the audit log (see secretClient).
+	sc := newSecretClient(httpClient, base, tok)
+	fetch := sc.fetch
+	list := sc.list
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	render := func() (agent.Result, error) {

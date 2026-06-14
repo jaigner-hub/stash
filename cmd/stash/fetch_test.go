@@ -118,3 +118,69 @@ func TestSecretClientEscapesPath(t *testing.T) {
 		t.Fatalf("path = %q", gotPath)
 	}
 }
+
+// The agent's list() must revalidate with If-None-Match and reuse the cached key
+// set on a 304 — so steady polls of an unchanged set transfer no body (and the
+// server records no `list` audit row).
+func TestSecretClientListConditionalGet(t *testing.T) {
+	var disclosures int32
+	etag := `"l0001"`
+	keys := `{"keys":["kg/web/A","kg/web/B"]}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/secrets" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		if r.Header.Get("If-None-Match") == etag {
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		atomic.AddInt32(&disclosures, 1)
+		w.Header().Set("ETag", etag)
+		w.Write([]byte(keys))
+	}))
+	defer srv.Close()
+
+	c := newSecretClient(srv.Client(), srv.URL, "")
+	want := []string{"kg/web/A", "kg/web/B"}
+	for i := 0; i < 6; i++ {
+		got, err := c.list()
+		if err != nil || strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("poll %d: got %v, %v", i, got, err)
+		}
+	}
+	if got := atomic.LoadInt32(&disclosures); got != 1 {
+		t.Fatalf("expected one list disclosure across 6 polls, got %d", got)
+	}
+}
+
+// A changed key set (new ETag) makes the stale validator miss, and the agent
+// picks up the new set.
+func TestSecretClientListPicksUpChange(t *testing.T) {
+	var etag, keys atomic.Value
+	etag.Store(`"l1"`)
+	keys.Store(`{"keys":["a"]}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := etag.Load().(string)
+		if r.Header.Get("If-None-Match") == cur {
+			w.Header().Set("ETag", cur)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", cur)
+		w.Write([]byte(keys.Load().(string)))
+	}))
+	defer srv.Close()
+
+	c := newSecretClient(srv.Client(), srv.URL, "")
+	if got, err := c.list(); err != nil || strings.Join(got, ",") != "a" {
+		t.Fatalf("first list: %v, %v", got, err)
+	}
+	etag.Store(`"l2"`)
+	keys.Store(`{"keys":["a","b"]}`)
+	if got, err := c.list(); err != nil || strings.Join(got, ",") != "a,b" {
+		t.Fatalf("after change: %v, %v", got, err)
+	}
+}

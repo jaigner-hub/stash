@@ -139,3 +139,65 @@ func TestConditionalGetNotAudited(t *testing.T) {
 		t.Fatalf("stale-ETag read should be audited; want 2 reads total, got %d", n)
 	}
 }
+
+// The -auto agent lists keys every poll; an unchanged key SET must revalidate to
+// 304 and add no `list` audit row. A key added/removed changes the ETag, so the
+// next list discloses and is recorded again.
+func TestListConditionalGetNotAudited(t *testing.T) {
+	a := &fakeAuditor{}
+	h := New(newFake(), a, nil)
+	put := func(p string) {
+		b, _ := json.Marshal(secretBody{Value: "v"})
+		if rec := do(t, h, "PUT", "/v1/secret/"+p, b); rec.Code != http.StatusNoContent {
+			t.Fatalf("PUT %s: %d", p, rec.Code)
+		}
+	}
+	put("kg/web/A")
+	put("kg/web/B")
+
+	// First list discloses the set, returns an ETag, and is audited.
+	rec := do(t, h, "GET", "/v1/secrets", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first list: %d", rec.Code)
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("expected an ETag on the 200 list")
+	}
+	if n := len(a.byAction("list")); n != 1 {
+		t.Fatalf("first list should be audited once, got %d", n)
+	}
+
+	// Steady polls with the matching ETag: 304, no body, no new audit row.
+	for i := 0; i < 5; i++ {
+		r := httptest.NewRequest("GET", "/v1/secrets", nil)
+		r.Header.Set("If-None-Match", etag)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, r)
+		if rr.Code != http.StatusNotModified {
+			t.Fatalf("revalidation %d: %d, want 304", i, rr.Code)
+		}
+		if rr.Body.Len() != 0 {
+			t.Fatalf("304 must not disclose a listing, got %q", rr.Body)
+		}
+	}
+	if n := len(a.byAction("list")); n != 1 {
+		t.Fatalf("304 revalidations must not be audited; want 1 list total, got %d", n)
+	}
+
+	// Adding a key changes the set → stale ETag misses → 200 + a fresh audit row.
+	put("kg/web/C")
+	r := httptest.NewRequest("GET", "/v1/secrets", nil)
+	r.Header.Set("If-None-Match", etag)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("after add: %d, want 200", rr.Code)
+	}
+	if got := rr.Header().Get("ETag"); got == etag || got == "" {
+		t.Fatalf("expected a fresh list ETag after add, got %q (old %q)", got, etag)
+	}
+	if n := len(a.byAction("list")); n != 2 {
+		t.Fatalf("changed-set list should be audited; want 2, got %d", n)
+	}
+}
