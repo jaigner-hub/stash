@@ -226,6 +226,49 @@ func (n *Node) Initialize(kek []byte, timeout time.Duration) error {
 	return n.apply(command{Op: opMeta, NodeID: n.cfg.NodeID, HTTPAddr: n.cfg.HTTPAddr})
 }
 
+// ClusterStatus is a snapshot of cluster membership for the UI/status endpoint.
+type ClusterStatus struct {
+	NodeID   string       `json:"node_id"`
+	IsLeader bool         `json:"is_leader"`
+	Sealed   bool         `json:"sealed"`
+	LeaderID string       `json:"leader_id"`
+	Servers  []ServerInfo `json:"servers"`
+}
+
+// ServerInfo describes one raft member.
+type ServerInfo struct {
+	ID       string `json:"id"`
+	Address  string `json:"address"`
+	Suffrage string `json:"suffrage"` // voter | nonvoter
+	Leader   bool   `json:"leader"`
+}
+
+// Status reports this node's view of cluster membership.
+func (n *Node) Status() ClusterStatus {
+	_, leaderID := n.raft.LeaderWithID()
+	cs := ClusterStatus{
+		NodeID:   n.cfg.NodeID,
+		IsLeader: n.IsLeader(),
+		Sealed:   n.store.Sealed(),
+		LeaderID: string(leaderID),
+	}
+	if cf := n.raft.GetConfiguration(); cf.Error() == nil {
+		for _, s := range cf.Configuration().Servers {
+			suf := "voter"
+			if s.Suffrage == raft.Nonvoter {
+				suf = "nonvoter"
+			}
+			cs.Servers = append(cs.Servers, ServerInfo{
+				ID:       string(s.ID),
+				Address:  string(s.Address),
+				Suffrage: suf,
+				Leader:   string(s.ID) == string(leaderID),
+			})
+		}
+	}
+	return cs
+}
+
 // ClusterConfig returns the cluster id and join secret (once initialized).
 func (n *Node) ClusterConfig() (id, secret string) { return n.fsm.clusterConfig() }
 

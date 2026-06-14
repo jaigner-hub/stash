@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/store"
 )
 
@@ -73,6 +74,9 @@ func (f *fakeBackend) Join(id, raftAddr, httpAddr string) error {
 	return nil
 }
 func (f *fakeBackend) VerifyJoinSecret(s string) bool { return s == f.secret }
+func (f *fakeBackend) Status() cluster.ClusterStatus {
+	return cluster.ClusterStatus{NodeID: "fake", IsLeader: f.leader}
+}
 
 func do(t *testing.T, h http.Handler, method, target string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()

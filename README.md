@@ -5,9 +5,9 @@ secret storage that is genuinely *easy* to stand up — no external database, no
 Redis, no Kubernetes. One Go binary that does it all, replicating state with
 embedded Raft.
 
-> **Status: milestone 3 — easy join (token pairing).** This is a hobby project
-> and is **not production-ready**. Do not trust it with real secrets yet. (For
-> the keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
+> **Status: milestone 4 — embedded web console.** This is a hobby project and is
+> **not production-ready**. Do not trust it with real secrets yet. (For the
+> keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
 
 ## Why
 
@@ -118,6 +118,22 @@ file so restart/self-heal still works.
 In production the unseal key is the only thing you keep in SOPS, decrypted to
 tmpfs at deploy. That's the entire residual SOPS surface.
 
+## Web console
+
+Open `http://<node>:8200/` in a browser. The console is a dependency-free
+HTML/CSS/vanilla-JS app embedded in the binary (no framework, no CDN, no npm) —
+it talks to the JSON API below. It shows cluster membership (leader/followers,
+voter/witness, sealed state) and lets you add, reveal, copy, edit, and delete
+secrets. A witness node shows `sealed` and refuses reveals.
+
+Access control is **network-level** for now — front it with **Tailscale Serve**
+(the GlitchTip/Grafana admin-plane pattern); in-app auth arrives with the
+identity milestone. Don't expose the port to untrusted networks.
+
+```
+internal/ui/assets/{index.html,style.css,app.js}  →  go:embed  →  served at /
+```
+
 ## API
 
 | Method | Path | Body | Result |
@@ -128,6 +144,8 @@ tmpfs at deploy. That's the entire residual SOPS surface.
 | `PUT`    | `/v1/secret/<path>`  | `{"value":"..."}` | `204` (forwarded to leader) |
 | `DELETE` | `/v1/secret/<path>`  | — | `204` (forwarded to leader) |
 | `POST`   | `/v1/cluster/join`   | `{"node_id","raft_addr","http_addr","secret"}` | `200` (secret-gated) |
+| `GET`    | `/v1/cluster/status` | — | `{"node_id","is_leader","sealed","leader_id","servers":[…]}` |
+| `GET`    | `/` and `/app.js`, `/style.css` | — | embedded web console |
 
 `<path>` may contain slashes (`kg/web/SECRET_KEY`).
 
@@ -139,7 +157,7 @@ and each later milestone now *feeds* it (audit view, history/diff, login).
 - [x] **M1 — single encrypted node**: bbolt + envelope encryption + auto-unseal, HTTP API.
 - [x] **M2 — HA**: embedded `hashicorp/raft` (voters + sealed witness), leader-forwarding, bootstrap.
 - [x] **M3 — easy join**: one-token pairing, auto address-detection, secret-gated join, restart from `cluster.json`.
-- [ ] **M4 — Web UI v1**: embedded UI (tailnet-gated via Tailscale Serve) — view/add/edit/delete secrets, cluster health.
+- [x] **M4 — Web UI v1**: embedded console (dependency-free, tailnet-gated) — view/add/edit/delete secrets, cluster health.
 - [ ] **M5 — identity & access**: machine-identity tokens (hashed at rest) + path-prefix ACLs; UI gains login.
 - [ ] **M6 — audit**: hash-chained append-only audit log (reads + writes) → Loki; UI gains an audit view.
 - [ ] **M7 — versioning**: keep last N versions per path; UI gains history/diff.

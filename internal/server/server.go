@@ -14,6 +14,7 @@ import (
 
 	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/store"
+	"github.com/jaigner-hub/stash/internal/ui"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB — secrets are small; cap abuse.
@@ -30,6 +31,7 @@ type Backend interface {
 	LeaderHTTPAddr() (addr string, known bool)
 	Join(nodeID, raftAddr, httpAddr string) error
 	VerifyJoinSecret(secret string) bool
+	Status() cluster.ClusterStatus
 }
 
 type server struct {
@@ -50,6 +52,9 @@ func New(b Backend, log *slog.Logger) http.Handler {
 	mux.HandleFunc("PUT /v1/secret/{path...}", srv.put)
 	mux.HandleFunc("DELETE /v1/secret/{path...}", srv.delete)
 	mux.HandleFunc("POST /v1/cluster/join", srv.join)
+	mux.HandleFunc("GET /v1/cluster/status", srv.clusterStatus)
+	// Embedded web console at / (most specific /v1/... routes win over this).
+	mux.Handle("/", ui.Handler())
 	return mux
 }
 
@@ -145,6 +150,10 @@ func (s *server) join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "joined"})
+}
+
+func (s *server) clusterStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.backend.Status())
 }
 
 // proxyToLeader reverse-proxies the current request to the leader's API.

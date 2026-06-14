@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>stash</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>stash</h1>
+    <span id="node-badge" class="badge">connecting…</span>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Cluster</h2>
+      <table id="cluster">
+        <thead><tr><th>Node</th><th>Address</th><th>Role</th><th>State</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2 id="form-title">Add secret</h2>
+      <form id="secret-form" autocomplete="off">
+        <label>Path
+          <input id="path" placeholder="kg/web/SECRET_KEY" required>
+        </label>
+        <label>Value
+          <textarea id="value" rows="3" placeholder="secret value" required></textarea>
+        </label>
+        <div class="actions">
+          <button type="submit">Save</button>
+          <button type="button" id="cancel" class="ghost" hidden>Cancel</button>
+          <span id="form-msg" class="msg"></span>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="row-between">
+        <h2>Secrets</h2>
+        <input id="filter" class="filter" placeholder="filter…">
+      </div>
+      <table id="secrets">
+        <thead><tr><th>Path</th><th>Value</th><th class="right">Actions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p id="empty" class="muted" hidden>No secrets yet.</p>
+    </section>
+  </main>
+
+  <footer class="muted">stash · embedded console · network-gated</footer>
+  <script src="/app.js"></script>
+</body>
+</html>
