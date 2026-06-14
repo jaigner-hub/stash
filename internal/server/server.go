@@ -24,7 +24,7 @@ import (
 // implements it; pass nil to disable auditing (e.g. in tests).
 type Auditor interface {
 	Record(identity, action, path, result string) error
-	Recent(n int) ([]audit.Entry, error)
+	Page(before uint64, limit int) ([]audit.Entry, error)
 	Verify() (bool, uint64, error)
 }
 
@@ -434,13 +434,19 @@ func (s *server) auditLog(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"entries": []audit.Entry{}, "verified": true, "count": 0})
 		return
 	}
-	limit := 100
+	limit := 50
 	if q := r.URL.Query().Get("limit"); q != "" {
 		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 1000 {
 			limit = n
 		}
 	}
-	entries, err := s.audit.Recent(limit)
+	var before uint64
+	if q := r.URL.Query().Get("before"); q != "" {
+		if n, err := strconv.ParseUint(q, 10, 64); err == nil {
+			before = n
+		}
+	}
+	entries, err := s.audit.Page(before, limit)
 	if err != nil {
 		s.writeErr(w, err)
 		return

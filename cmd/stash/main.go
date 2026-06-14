@@ -20,12 +20,14 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,6 +35,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jaigner-hub/stash/internal/agent"
 	"github.com/jaigner-hub/stash/internal/audit"
 	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/crypto"
@@ -55,6 +58,8 @@ func main() {
 		err = cmdJoin(os.Args[2:])
 	case "token":
 		err = cmdToken(os.Args[2:])
+	case "agent":
+		err = cmdAgent(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -78,6 +83,7 @@ usage:
   stash server [flags]                     restart an existing node
   stash join   <token> [flags]             add a node (addresses auto-detected)
   stash token  [--no-key] [flags]          mint another join token
+  stash agent  -template T -out O [flags]  render secrets to a file (last-good cache)
 
 run "stash <command> -h" for command flags.
 `)
@@ -338,6 +344,98 @@ func cmdToken(args []string) error {
 		fmt.Fprintln(os.Stderr, "WARNING: this token contains the master unseal key — treat it like a password.")
 	}
 	return nil
+}
+
+func cmdAgent(args []string) error {
+	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+	api := fs.String("api", "http://127.0.0.1:8200", "stash API URL")
+	tokenFlag := fs.String("token", "", `access token (or $STASH_TOKEN)`)
+	tmpl := fs.String("template", "", `template file using {{secret "path"}} (required)`)
+	out := fs.String("out", "", "output file, typically on tmpfs (required)")
+	cache := fs.String("cache", "", "last-good cache on persistent disk (default <out>.last)")
+	interval := fs.Duration("interval", 0, "re-render every interval; 0 = render once and exit")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *tmpl == "" || *out == "" {
+		return errors.New("-template and -out are required")
+	}
+	tok := *tokenFlag
+	if tok == "" {
+		tok = os.Getenv("STASH_TOKEN")
+	}
+	cachePath := *cache
+	if cachePath == "" {
+		cachePath = *out + ".last"
+	}
+
+	base := strings.TrimRight(*api, "/")
+	fetch := func(path string) (string, error) {
+		segs := strings.Split(path, "/")
+		for i, s := range segs {
+			segs[i] = url.PathEscape(s)
+		}
+		req, err := http.NewRequest(http.MethodGet, base+"/v1/secret/"+strings.Join(segs, "/"), nil)
+		if err != nil {
+			return "", err
+		}
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("fetch %s: status %d", path, resp.StatusCode)
+		}
+		var body struct {
+			Value string `json:"value"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return "", err
+		}
+		return body.Value, nil
+	}
+
+	cfg := agent.Config{Template: *tmpl, Out: *out, Cache: cachePath}
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	renderOnce := func() error {
+		fell, err := agent.RenderOnce(cfg, fetch)
+		switch {
+		case err != nil:
+			return err
+		case fell:
+			log.Warn("cluster unreachable; served last-good cache", "out", *out)
+		default:
+			log.Info("rendered secrets", "out", *out)
+		}
+		return nil
+	}
+
+	if *interval <= 0 {
+		return renderOnce()
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := renderOnce(); err != nil {
+		log.Error("render failed", "err", err) // keep looping; the cluster may recover
+	}
+	t := time.NewTicker(*interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if err := renderOnce(); err != nil {
+				log.Error("render failed", "err", err)
+			}
+		}
+	}
 }
 
 // serve runs the HTTP API and a background unsealer until interrupted.

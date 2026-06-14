@@ -258,7 +258,7 @@ async function restoreVersion(path, seq) {
   const pr = await apiJSON("PUT", pathURL(path), { value });
   if (pr.ok) {
     loadSecrets();
-    loadAudit();
+    loadAudit(true);
   }
 }
 
@@ -276,8 +276,10 @@ async function editSecret(path) {
 async function del(path) {
   if (!confirm("Delete " + path + " ?")) return;
   const r = await authFetch(pathURL(path), { method: "DELETE" });
-  if (r.ok) loadSecrets();
-  else msg("Delete failed: " + r.status, true);
+  if (r.ok) {
+    loadSecrets();
+    loadAudit(true);
+  } else msg("Delete failed: " + r.status, true);
 }
 
 function msg(t, isErr) {
@@ -304,6 +306,7 @@ $("#secret-form").addEventListener("submit", async (e) => {
     msg("Saved.", false);
     resetForm();
     loadSecrets();
+    loadAudit(true);
   } else {
     const j = await r.json().catch(() => ({}));
     msg("Save failed: " + (j.error || r.status), true);
@@ -348,7 +351,10 @@ async function loadIdentities() {
 async function delIdentity(name) {
   if (!confirm("Delete identity " + name + " ?")) return;
   const r = await authFetch("/v1/identities/" + encodeURIComponent(name), { method: "DELETE" });
-  if (r.ok) loadIdentities();
+  if (r.ok) {
+    loadIdentities();
+    loadAudit(true);
+  }
 }
 
 $("#identity-form").addEventListener("submit", async (e) => {
@@ -371,6 +377,7 @@ $("#identity-form").addEventListener("submit", async (e) => {
     box.innerHTML = `New token for <b>${esc(name)}</b> (copy now — shown once):<br><code>${esc(t)}</code>`;
     $("#id-name").value = "";
     loadIdentities();
+    loadAudit(true);
   } else {
     const j = await r.json().catch(() => ({}));
     box.hidden = false;
@@ -379,10 +386,14 @@ $("#identity-form").addEventListener("submit", async (e) => {
   }
 });
 
-// ---------- audit (admin only) ----------
+// ---------- audit (admin only, paginated) ----------
 
-async function loadAudit() {
-  const r = await authFetch("/v1/audit?limit=50");
+const AUDIT_PAGE = 25;
+let auditOldest = 0; // seq of the oldest row currently shown
+
+async function loadAudit(reset) {
+  const before = reset ? 0 : auditOldest;
+  const r = await authFetch(`/v1/audit?limit=${AUDIT_PAGE}&before=${before}`);
   if (!r.ok) {
     $("#audit-card").hidden = true;
     return;
@@ -395,20 +406,31 @@ async function loadAudit() {
   badge.className = "badge " + (data.verified ? "ok" : "warn");
 
   const body = tbody("#audit");
-  body.innerHTML = "";
-  (data.entries || []).forEach((e) => {
-    const t = (e.time || "").replace("T", " ").replace(/\.\d+/, "").replace("Z", "");
-    const rcls = e.result === "ok" ? "ok" : e.result === "denied" || e.result === "error" ? "err" : "muted";
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      `<td class="muted">${esc(t)}</td>` +
-      `<td>${esc(e.identity)}</td>` +
-      `<td>${esc(e.action)}</td>` +
-      `<td class="path">${esc(e.path)}</td>` +
-      `<td class="${rcls}">${esc(e.result)}</td>`;
-    body.appendChild(tr);
-  });
+  if (reset) {
+    body.innerHTML = "";
+    auditOldest = 0;
+  }
+  const entries = data.entries || [];
+  entries.forEach((e) => body.appendChild(auditRow(e)));
+  if (entries.length) auditOldest = entries[entries.length - 1].seq;
+  $("#audit-more").hidden = !(entries.length === AUDIT_PAGE && auditOldest > 1);
 }
+
+function auditRow(e) {
+  const t = (e.time || "").replace("T", " ").replace(/\.\d+/, "").replace("Z", "");
+  const rcls = e.result === "ok" ? "ok" : e.result === "denied" || e.result === "error" ? "err" : "muted";
+  const tr = document.createElement("tr");
+  tr.innerHTML =
+    `<td class="muted">${esc(t)}</td>` +
+    `<td>${esc(e.identity)}</td>` +
+    `<td>${esc(e.action)}</td>` +
+    `<td class="path">${esc(e.path)}</td>` +
+    `<td class="${rcls}">${esc(e.result)}</td>`;
+  return tr;
+}
+
+$("#audit-refresh").onclick = () => loadAudit(true);
+$("#audit-more").onclick = () => loadAudit(false);
 
 // ---------- boot ----------
 
@@ -416,11 +438,10 @@ function refresh() {
   loadStatus();
   loadSecrets();
   loadIdentities();
-  loadAudit();
+  loadAudit(true);
 }
 
 refresh();
-setInterval(() => {
-  loadStatus();
-  loadAudit();
-}, 4000);
+// Only the cluster panel auto-refreshes; the audit log is paged and refreshed
+// manually so "Load more" isn't clobbered.
+setInterval(loadStatus, 4000);

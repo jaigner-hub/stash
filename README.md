@@ -5,7 +5,7 @@ secret storage that is genuinely *easy* to stand up — no external database, no
 Redis, no Kubernetes. One Go binary that does it all, replicating state with
 embedded Raft.
 
-> **Status: milestone 7 — secret versioning.** This is a hobby project and is
+> **Status: M1–M8 complete (dev roadmap done).** This is a hobby project and is
 > **not production-ready**. Do not trust it with real secrets yet. (For the
 > keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
 
@@ -169,8 +169,35 @@ logged too, with the identity, action, path, and result.
 It's intentionally **per-node** — each node logs the operations it actually
 served (reads are served locally, so only a per-node log captures them) — and
 lives in its own `audit.db`, separate from the replicated store. View it at
-`GET /v1/audit` (admin) or in the console's Audit panel, which shows recent
-entries and a chain-integrity indicator.
+`GET /v1/audit` (admin, paginated via `limit` + `before` cursor) or in the
+console's Audit panel, which shows entries (with a Load-more button) and a
+chain-integrity indicator.
+
+## Agent (render to file + self-heal)
+
+`stash agent` renders secrets into a local file from a template and keeps a
+**last-good cache**. If the cluster is briefly unreachable (e.g. a box rebooting
+before the cluster is back), it re-serves the cache so the app still starts —
+the reboot-self-heal property carried over from keygrip's ADR-0001.
+
+```sh
+cat > app.env.tmpl <<'EOF'
+SECRET_KEY={{secret "kg/web/SECRET_KEY"}}
+DATABASE_URL={{secret "kg/web/DATABASE_URL"}}
+EOF
+
+STASH_TOKEN=stash-… stash agent \
+  -api http://10.0.0.1:8200 \
+  -template app.env.tmpl \
+  -out /run/keygrip/app.env \      # tmpfs
+  -cache /var/lib/stash/app.env.last \  # persistent, survives reboot
+  -interval 1m                     # omit for render-once
+```
+
+A failed render never writes a partial file; on fetch failure it copies the
+cache to `-out` and exits 0 (logging a warning). With no cache and an
+unreachable cluster, it fails loudly. For self-heal, put `-out` on tmpfs and
+`-cache` on persistent disk.
 
 ## Web console
 
@@ -203,7 +230,7 @@ internal/ui/assets/{index.html,style.css,app.js}  →  go:embed  →  served at 
 | `GET`    | `/v1/identities`     | — | `{"identities":[…]}` (admin) |
 | `POST`   | `/v1/identities`     | `{"name","admin","policies":[…]}` | `{"name","token"}` (admin) |
 | `DELETE` | `/v1/identities/{name}` | — | `204` (admin) |
-| `GET`    | `/v1/audit?limit=N`  | — | `{"entries":[…],"verified":bool,"count":N}` (admin) |
+| `GET`    | `/v1/audit?limit=N&before=SEQ` | — | `{"entries":[…],"verified":bool,"count":N}` (admin, paginated) |
 | `GET`    | `/` and `/app.js`, `/style.css` | — | embedded web console |
 
 All `/v1/secret*`, `/v1/secrets`, `/v1/cluster/status`, and `/v1/identities`
@@ -224,7 +251,7 @@ and each later milestone now *feeds* it (audit view, history/diff, login).
 - [x] **M5 — identity & access**: bearer-token identities (hashed at rest) + path-prefix ACLs; root token; UI login + Identities panel; open-mode for upgrades.
 - [x] **M6 — audit**: per-node hash-chained append-only audit log (reads, writes, denials, identity changes); admin API + UI panel with chain-integrity check.
 - [x] **M7 — versioning**: keep last N versions per path (replicated, pruned); read any version; UI History view with view + restore.
-- [ ] **M8 — agent**: `stash agent` renders secrets → tmpfs with last-good cache (reboot-during-outage self-heal).
+- [x] **M8 — agent**: `stash agent` renders secrets to a file from a template with a last-good cache (reboot-during-outage self-heal).
 - [ ] follow-ups: join-secret rotation (`stash token rotate`), inter-node mTLS (CA fingerprint in token), Tailscale auto-discovery, ship audit log to Loki.
 
 ## Security notes (read before trusting it)

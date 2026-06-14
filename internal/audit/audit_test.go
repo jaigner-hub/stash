@@ -47,6 +47,44 @@ func TestAppendAndVerify(t *testing.T) {
 	}
 }
 
+func TestPage(t *testing.T) {
+	l, _ := newLog(t)
+	for i := 0; i < 10; i++ {
+		if err := l.Record("a", "read", "p", "ok"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// First page: newest 4 (seq 10..7).
+	p1, err := l.Page(0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p1) != 4 || p1[0].Seq != 10 || p1[3].Seq != 7 {
+		t.Fatalf("page1 wrong: %v", seqs(p1))
+	}
+	// Next page: before the oldest of p1 (seq 7) -> 6..3.
+	p2, err := l.Page(p1[len(p1)-1].Seq, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p2) != 4 || p2[0].Seq != 6 || p2[3].Seq != 3 {
+		t.Fatalf("page2 wrong: %v", seqs(p2))
+	}
+	// Final page: 2..1.
+	p3, _ := l.Page(p2[len(p2)-1].Seq, 4)
+	if len(p3) != 2 || p3[0].Seq != 2 || p3[1].Seq != 1 {
+		t.Fatalf("page3 wrong: %v", seqs(p3))
+	}
+}
+
+func seqs(es []Entry) []uint64 {
+	out := make([]uint64, len(es))
+	for i, e := range es {
+		out[i] = e.Seq
+	}
+	return out
+}
+
 func TestChainContinuesAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.db")
 	l1, err := Open(path, "node1")

@@ -117,11 +117,28 @@ func (l *Log) Record(identity, action, path, result string) error {
 }
 
 // Recent returns up to n entries, newest first.
-func (l *Log) Recent(n int) ([]Entry, error) {
+func (l *Log) Recent(n int) ([]Entry, error) { return l.Page(0, n) }
+
+// Page returns up to limit entries with seq < before, newest first. A before of
+// 0 starts from the newest entry. Use the seq of the last returned entry as the
+// next page's before cursor.
+func (l *Log) Page(before uint64, limit int) ([]Entry, error) {
 	out := []Entry{}
 	err := l.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucket).Cursor()
-		for k, v := c.Last(); k != nil && len(out) < n; k, v = c.Prev() {
+		var k, v []byte
+		if before == 0 {
+			k, v = c.Last()
+		} else {
+			bk := make([]byte, 8)
+			binary.BigEndian.PutUint64(bk, before)
+			if sk, _ := c.Seek(bk); sk == nil {
+				k, v = c.Last() // before is past the newest → start at newest
+			} else {
+				k, v = c.Prev() // first entry strictly < before
+			}
+		}
+		for ; k != nil && len(out) < limit; k, v = c.Prev() {
 			var e Entry
 			if err := json.Unmarshal(v, &e); err != nil {
 				return err

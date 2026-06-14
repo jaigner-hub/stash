@@ -87,12 +87,16 @@
     <section class="card" id="audit-card" hidden>
       <div class="row-between">
         <h2>Audit log</h2>
-        <span id="audit-status" class="badge"></span>
+        <span>
+          <span id="audit-status" class="badge"></span>
+          <button id="audit-refresh" class="ghost">Refresh</button>
+        </span>
       </div>
       <table id="audit">
         <thead><tr><th>Time (UTC)</th><th>Identity</th><th>Action</th><th>Path</th><th>Result</th></tr></thead>
         <tbody></tbody>
       </table>
+      <button id="audit-more" class="ghost" hidden>Load more</button>
     </section>
   </main>
 
