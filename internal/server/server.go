@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 
 	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/store"
@@ -32,6 +33,11 @@ type Backend interface {
 	Join(nodeID, raftAddr, httpAddr string) error
 	VerifyJoinSecret(secret string) bool
 	Status() cluster.ClusterStatus
+	Authenticate(token string) (*cluster.Identity, error)
+	HasIdentities() bool
+	CreateIdentity(name string, admin bool, policies []cluster.Policy) (string, error)
+	DeleteIdentity(name string) error
+	ListIdentities() ([]cluster.Identity, error)
 }
 
 type server struct {
@@ -53,9 +59,52 @@ func New(b Backend, log *slog.Logger) http.Handler {
 	mux.HandleFunc("DELETE /v1/secret/{path...}", srv.delete)
 	mux.HandleFunc("POST /v1/cluster/join", srv.join)
 	mux.HandleFunc("GET /v1/cluster/status", srv.clusterStatus)
+	mux.HandleFunc("GET /v1/identities", srv.listIdentities)
+	mux.HandleFunc("POST /v1/identities", srv.createIdentity)
+	mux.HandleFunc("DELETE /v1/identities/{name}", srv.deleteIdentity)
 	// Embedded web console at / (most specific /v1/... routes win over this).
 	mux.Handle("/", ui.Handler())
 	return mux
+}
+
+// auth resolves the request's identity. In "open mode" (no identities exist
+// yet, e.g. just after an upgrade) it returns a synthetic admin so the cluster
+// isn't locked out. Otherwise a valid bearer token is required; on failure it
+// writes 401 and returns ok=false.
+func (s *server) auth(w http.ResponseWriter, r *http.Request) (*cluster.Identity, bool) {
+	if !s.backend.HasIdentities() {
+		return &cluster.Identity{Name: "open-mode", Admin: true}, true
+	}
+	tok := bearerToken(r)
+	if tok == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		return nil, false
+	}
+	id, err := s.backend.Authenticate(tok)
+	if err != nil {
+		s.log.Error("authenticate", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return nil, false
+	}
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
+		return nil, false
+	}
+	return id, true
+}
+
+func bearerToken(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	}
+	if c, err := r.Cookie("stash_token"); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
+func forbid(w http.ResponseWriter) {
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
 }
 
 type secretBody struct {
@@ -71,7 +120,16 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) get(w http.ResponseWriter, r *http.Request) {
-	v, err := s.backend.Get(r.PathValue("path"))
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	path := r.PathValue("path")
+	if !id.Can(cluster.CapRead, path) {
+		forbid(w)
+		return
+	}
+	v, err := s.backend.Get(path)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -80,6 +138,14 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) put(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	if !id.Can(cluster.CapWrite, r.PathValue("path")) {
+		forbid(w)
+		return
+	}
 	if !s.backend.IsLeader() {
 		s.proxyToLeader(w, r)
 		return
@@ -103,6 +169,14 @@ func (s *server) put(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) delete(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	if !id.Can(cluster.CapDelete, r.PathValue("path")) {
+		forbid(w)
+		return
+	}
 	if !s.backend.IsLeader() {
 		s.proxyToLeader(w, r)
 		return
@@ -115,15 +189,23 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) list(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
 	keys, err := s.backend.List()
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	if keys == nil {
-		keys = []string{}
+	// Show only paths this identity may read.
+	visible := []string{}
+	for _, k := range keys {
+		if id.Can(cluster.CapRead, k) {
+			visible = append(visible, k)
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+	writeJSON(w, http.StatusOK, map[string]any{"keys": visible})
 }
 
 func (s *server) join(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +235,86 @@ func (s *server) join(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) clusterStatus(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.auth(w, r); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, s.backend.Status())
+}
+
+func (s *server) listIdentities(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	if !id.Admin {
+		forbid(w)
+		return
+	}
+	ids, err := s.backend.ListIdentities()
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	if ids == nil {
+		ids = []cluster.Identity{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"identities": ids})
+}
+
+func (s *server) createIdentity(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	if !id.Admin {
+		forbid(w)
+		return
+	}
+	if !s.backend.IsLeader() {
+		s.proxyToLeader(w, r)
+		return
+	}
+	defer r.Body.Close()
+	var req struct {
+		Name     string           `json:"name"`
+		Admin    bool             `json:"admin"`
+		Policies []cluster.Policy `json:"policies"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	token, err := s.backend.CreateIdentity(req.Name, req.Admin, req.Policies)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	// The token is shown exactly once.
+	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name, "token": token})
+}
+
+func (s *server) deleteIdentity(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.auth(w, r)
+	if !ok {
+		return
+	}
+	if !id.Admin {
+		forbid(w)
+		return
+	}
+	if !s.backend.IsLeader() {
+		s.proxyToLeader(w, r)
+		return
+	}
+	if err := s.backend.DeleteIdentity(r.PathValue("name")); err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // proxyToLeader reverse-proxies the current request to the leader's API.

@@ -7,9 +7,20 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+  <div id="login" class="login-overlay" hidden>
+    <form id="login-form" class="card login-card">
+      <h2>Sign in</h2>
+      <p class="muted">Paste an access token — e.g. the root token printed at bootstrap.</p>
+      <input id="login-token" type="password" placeholder="stash-…" autocomplete="off">
+      <button type="submit">Sign in</button>
+      <p id="login-msg" class="msg"></p>
+    </form>
+  </div>
+
   <header>
     <h1>stash</h1>
     <span id="node-badge" class="badge">connecting…</span>
+    <button id="logout" class="ghost" hidden>Sign out</button>
   </header>
 
   <main>
@@ -48,6 +59,29 @@
         <tbody></tbody>
       </table>
       <p id="empty" class="muted" hidden>No secrets yet.</p>
+    </section>
+
+    <section class="card" id="identities-card" hidden>
+      <h2>Identities</h2>
+      <table id="identities">
+        <thead><tr><th>Name</th><th>Admin</th><th>Policies</th><th class="right">Actions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <details class="create-identity">
+        <summary>Create identity</summary>
+        <form id="identity-form">
+          <label>Name <input id="id-name" placeholder="ci-deploy" autocomplete="off" required></label>
+          <label class="inline"><input type="checkbox" id="id-admin"> Admin (full access)</label>
+          <label>Path prefix <input id="id-prefix" placeholder="kg/web/" autocomplete="off"></label>
+          <div class="caps">
+            <label class="inline"><input type="checkbox" id="cap-read" checked> read</label>
+            <label class="inline"><input type="checkbox" id="cap-write"> write</label>
+            <label class="inline"><input type="checkbox" id="cap-delete"> delete</label>
+          </div>
+          <button type="submit">Create</button>
+          <div id="id-token" class="token-box" hidden></div>
+        </form>
+      </details>
     </section>
   </main>
 

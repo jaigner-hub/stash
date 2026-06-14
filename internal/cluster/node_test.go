@@ -65,7 +65,7 @@ func mustKey(t *testing.T) []byte {
 func TestSingleNodeCRUD(t *testing.T) {
 	kek := mustKey(t)
 	n, _, _ := newNode(t, "n1", true)
-	if err := n.Initialize(kek, 10*time.Second); err != nil {
+	if _, err := n.Initialize(kek, 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.Unseal(kek, 10*time.Second); err != nil {
@@ -99,7 +99,7 @@ func TestSingleNodeCRUD(t *testing.T) {
 func TestThreeNodeReplication(t *testing.T) {
 	kek := mustKey(t)
 	n1, _, h1 := newNode(t, "n1", true)
-	if err := n1.Initialize(kek, 10*time.Second); err != nil {
+	if _, err := n1.Initialize(kek, 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if err := n1.Unseal(kek, 10*time.Second); err != nil {
@@ -146,7 +146,7 @@ func TestThreeNodeReplication(t *testing.T) {
 func TestWitnessReplicatesButCannotRead(t *testing.T) {
 	kek := mustKey(t)
 	n1, _, _ := newNode(t, "n1", true)
-	if err := n1.Initialize(kek, 10*time.Second); err != nil {
+	if _, err := n1.Initialize(kek, 10*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if err := n1.Unseal(kek, 10*time.Second); err != nil {

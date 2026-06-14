@@ -189,23 +189,24 @@ func (n *Node) Join(nodeID, raftAddr, httpAddr string) error {
 
 // Initialize is called on a freshly bootstrapped node: it waits for leadership,
 // creates the cluster DEK (if not already present) and replicates it through the
-// log, then records its own API address. The KEK is required because this is
-// where the data key is born.
-func (n *Node) Initialize(kek []byte, timeout time.Duration) error {
+// log, records its own API address, and mints a root admin identity. It returns
+// the root token (empty if one already existed) to be shown once. The KEK is
+// required because this is where the data key is born.
+func (n *Node) Initialize(kek []byte, timeout time.Duration) (rootToken string, err error) {
 	if err := n.waitLeader(timeout); err != nil {
-		return err
+		return "", err
 	}
 	init, err := n.store.Initialized()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !init {
 		wrapped, canary, err := store.NewInitBlobs(kek)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if err := n.apply(command{Op: opInit, WrappedDEK: wrapped, Canary: canary}); err != nil {
-			return err
+			return "", err
 		}
 	}
 	// Establish cluster identity + join secret once, replicated to all nodes so
@@ -213,17 +214,20 @@ func (n *Node) Initialize(kek []byte, timeout time.Duration) error {
 	if id, secret := n.fsm.clusterConfig(); id == "" || secret == "" {
 		id, err := randomHex(8)
 		if err != nil {
-			return err
+			return "", err
 		}
 		secret, err := randomHex(32)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if err := n.apply(command{Op: opConfig, ClusterID: id, Secret: secret}); err != nil {
-			return err
+			return "", err
 		}
 	}
-	return n.apply(command{Op: opMeta, NodeID: n.cfg.NodeID, HTTPAddr: n.cfg.HTTPAddr})
+	if err := n.apply(command{Op: opMeta, NodeID: n.cfg.NodeID, HTTPAddr: n.cfg.HTTPAddr}); err != nil {
+		return "", err
+	}
+	return n.ensureRootIdentity()
 }
 
 // ClusterStatus is a snapshot of cluster membership for the UI/status endpoint.

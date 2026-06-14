@@ -81,3 +81,28 @@ button.link { background: transparent; border: none; color: var(--accent); paddi
 .msg { font-size: 13px; }
 .msg.ok { color: var(--ok); }
 .msg.err, .err { color: var(--danger); }
+
+/* login overlay */
+.login-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(8, 10, 14, 0.85);
+  display: flex; align-items: center; justify-content: center;
+}
+.login-card { width: 360px; max-width: 90vw; }
+.login-card h2 { color: var(--text); text-transform: none; letter-spacing: 0; font-size: 18px; }
+.login-card input { margin-bottom: 12px; }
+.login-card button { width: 100%; }
+
+/* identities */
+.inline { display: inline-flex; align-items: center; gap: 6px; margin: 0 14px 12px 0; color: var(--text); }
+.inline input { width: auto; margin: 0; }
+.caps { margin-bottom: 12px; }
+.create-identity { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+.create-identity summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.create-identity form { margin-top: 14px; }
+.token-box {
+  margin-top: 12px; padding: 12px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--accent);
+}
+.token-box code { color: var(--accent); word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.token-box.err { border-color: var(--danger); }

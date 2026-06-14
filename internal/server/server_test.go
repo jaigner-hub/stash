@@ -15,12 +15,13 @@ import (
 // fakeBackend is an in-memory Backend for HTTP-layer tests. leader and leaderURL
 // are configurable to exercise forwarding.
 type fakeBackend struct {
-	mu        sync.Mutex
-	data      map[string][]byte
-	leader    bool
-	leaderURL string
-	secret    string
-	joined    *struct{ id, raft, http string }
+	mu         sync.Mutex
+	data       map[string][]byte
+	leader     bool
+	leaderURL  string
+	secret     string
+	identities map[string]*cluster.Identity // token -> identity (empty => open mode)
+	joined     *struct{ id, raft, http string }
 }
 
 func newFake() *fakeBackend {
@@ -76,6 +77,41 @@ func (f *fakeBackend) Join(id, raftAddr, httpAddr string) error {
 func (f *fakeBackend) VerifyJoinSecret(s string) bool { return s == f.secret }
 func (f *fakeBackend) Status() cluster.ClusterStatus {
 	return cluster.ClusterStatus{NodeID: "fake", IsLeader: f.leader}
+}
+
+// Identity hooks. By default the fake has no identities (open mode), matching
+// the existing tests that don't send tokens.
+func (f *fakeBackend) HasIdentities() bool { return len(f.identities) > 0 }
+func (f *fakeBackend) Authenticate(token string) (*cluster.Identity, error) {
+	id, ok := f.identities[token]
+	if !ok {
+		return nil, nil
+	}
+	return id, nil
+}
+func (f *fakeBackend) CreateIdentity(name string, admin bool, policies []cluster.Policy) (string, error) {
+	tok := "tok-" + name
+	if f.identities == nil {
+		f.identities = map[string]*cluster.Identity{}
+	}
+	f.identities[tok] = &cluster.Identity{Name: name, Admin: admin, Policies: policies}
+	return tok, nil
+}
+func (f *fakeBackend) DeleteIdentity(name string) error {
+	for t, id := range f.identities {
+		if id.Name == name {
+			delete(f.identities, t)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+func (f *fakeBackend) ListIdentities() ([]cluster.Identity, error) {
+	var out []cluster.Identity
+	for _, id := range f.identities {
+		out = append(out, id.Redacted())
+	}
+	return out, nil
 }
 
 func do(t *testing.T, h http.Handler, method, target string, body []byte) *httptest.ResponseRecorder {

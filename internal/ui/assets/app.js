@@ -3,62 +3,90 @@
 const $ = (s) => document.querySelector(s);
 const tbody = (s) => document.querySelector(s + " tbody");
 
+let token = localStorage.getItem("stash_token") || "";
+
 function esc(s) {
   const d = document.createElement("div");
   d.textContent = s == null ? "" : String(s);
   return d.innerHTML;
 }
 
-// Encode a secret path for the URL while keeping "/" as a separator
-// (matches the GET /v1/secret/{path...} route).
+// Encode a secret path while keeping "/" as a separator (matches the
+// GET /v1/secret/{path...} route).
 function pathURL(p) {
   return "/v1/secret/" + p.split("/").map(encodeURIComponent).join("/");
 }
 
-async function api(method, path, body) {
-  const opt = { method, headers: {} };
-  if (body !== undefined) {
-    opt.headers["Content-Type"] = "application/json";
-    opt.body = JSON.stringify(body);
-  }
-  return fetch(path, opt);
+// authFetch adds the bearer token and surfaces the login overlay on 401.
+async function authFetch(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers);
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 401) requireLogin();
+  return r;
 }
+
+function apiJSON(method, path, body) {
+  return authFetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+// ---------- login ----------
+
+function requireLogin() {
+  $("#login").hidden = false;
+}
+
+$("#login-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  token = $("#login-token").value.trim();
+  localStorage.setItem("stash_token", token);
+  $("#login-token").value = "";
+  $("#login").hidden = true;
+  refresh();
+});
+
+$("#logout").onclick = () => {
+  token = "";
+  localStorage.removeItem("stash_token");
+  $("#logout").hidden = true;
+  requireLogin();
+};
+
+// ---------- cluster status ----------
 
 async function loadStatus() {
-  try {
-    const s = await (await fetch("/v1/cluster/status")).json();
-    const badge = $("#node-badge");
-    const role = s.is_leader ? "leader" : "follower";
-    const state = s.sealed ? "sealed" : "unsealed";
-    badge.textContent = `${s.node_id} · ${role} · ${state}`;
-    badge.className = "badge " + (s.sealed ? "warn" : "ok");
+  const r = await authFetch("/v1/cluster/status");
+  if (!r.ok) return;
+  const s = await r.json();
+  const badge = $("#node-badge");
+  badge.textContent = `${s.node_id} · ${s.is_leader ? "leader" : "follower"} · ${s.sealed ? "sealed" : "unsealed"}`;
+  badge.className = "badge " + (s.sealed ? "warn" : "ok");
 
-    const body = tbody("#cluster");
-    body.innerHTML = "";
-    (s.servers || []).forEach((sv) => {
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        `<td>${esc(sv.id)}${sv.leader ? " 👑" : ""}</td>` +
-        `<td>${esc(sv.address)}</td>` +
-        `<td>${esc(sv.suffrage)}</td>` +
-        `<td>${sv.leader ? "leader" : "—"}</td>`;
-      body.appendChild(tr);
-    });
-  } catch (e) {
-    $("#node-badge").textContent = "unreachable";
-    $("#node-badge").className = "badge warn";
-  }
+  const body = tbody("#cluster");
+  body.innerHTML = "";
+  (s.servers || []).forEach((sv) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td>${esc(sv.id)}${sv.leader ? " 👑" : ""}</td>` +
+      `<td>${esc(sv.address)}</td>` +
+      `<td>${esc(sv.suffrage)}</td>` +
+      `<td>${sv.leader ? "leader" : "—"}</td>`;
+    body.appendChild(tr);
+  });
+  $("#logout").hidden = !token;
 }
+
+// ---------- secrets ----------
 
 let allPaths = [];
 
 async function loadSecrets() {
-  try {
-    const data = await (await fetch("/v1/secrets")).json();
-    allPaths = data.keys || [];
-  } catch (e) {
-    allPaths = [];
-  }
+  const r = await authFetch("/v1/secrets");
+  allPaths = r.ok ? (await r.json()).keys || [] : [];
   renderSecrets();
 }
 
@@ -87,12 +115,11 @@ function renderSecrets() {
   });
 }
 
-// copySecret fetches a value and copies it to the clipboard WITHOUT rendering
-// it on screen — the safer default for shoulder-surfing / screen-sharing.
+// copySecret fetches a value and copies it WITHOUT rendering it on screen.
 async function copySecret(path, btn) {
-  const r = await fetch(pathURL(path));
+  const r = await authFetch(pathURL(path));
   if (!r.ok) {
-    flash(btn, r.status === 503 ? "sealed" : "error");
+    flash(btn, r.status === 503 ? "sealed" : r.status === 403 ? "denied" : "error");
     return;
   }
   const { value } = await r.json();
@@ -103,16 +130,13 @@ async function copyValue(value, btn) {
   flash(btn, (await copyText(value)) ? "Copied!" : "copy failed");
 }
 
-// copyText prefers the async Clipboard API (needs a secure context: https or
-// localhost) and falls back to an off-screen textarea for plain-HTTP access
-// over a LAN/tailnet IP. The value is never shown to the user either way.
 async function copyText(text) {
   if (navigator.clipboard && window.isSecureContext) {
     try {
       await navigator.clipboard.writeText(text);
       return true;
     } catch (e) {
-      /* fall through to legacy path */
+      /* fall through */
     }
   }
   try {
@@ -132,7 +156,6 @@ async function copyText(text) {
   }
 }
 
-// flash briefly replaces a button's label with feedback, then restores it.
 function flash(btn, text) {
   if (!btn.dataset.label) btn.dataset.label = btn.textContent;
   btn.textContent = text;
@@ -143,8 +166,7 @@ function flash(btn, text) {
   }, 1200);
 }
 
-// toggleReveal flips a row between masked and shown, switching the button label
-// between "Reveal" and "Hide".
+// toggleReveal flips a row between masked and shown.
 async function toggleReveal(tr, path, btn) {
   const cell = tr.querySelector(".val");
   if (btn.dataset.shown === "1") {
@@ -153,9 +175,9 @@ async function toggleReveal(tr, path, btn) {
     btn.dataset.shown = "";
     return;
   }
-  const r = await fetch(pathURL(path));
+  const r = await authFetch(pathURL(path));
   if (!r.ok) {
-    cell.innerHTML = `<span class="err">${r.status === 503 ? "sealed" : "error " + r.status}</span>`;
+    cell.innerHTML = `<span class="err">${r.status === 503 ? "sealed" : r.status === 403 ? "denied" : "error " + r.status}</span>`;
     return;
   }
   const { value } = await r.json();
@@ -168,7 +190,7 @@ async function toggleReveal(tr, path, btn) {
 }
 
 async function editSecret(path) {
-  const r = await fetch(pathURL(path));
+  const r = await authFetch(pathURL(path));
   if (!r.ok) return;
   const { value } = await r.json();
   $("#path").value = path;
@@ -180,7 +202,7 @@ async function editSecret(path) {
 
 async function del(path) {
   if (!confirm("Delete " + path + " ?")) return;
-  const r = await api("DELETE", pathURL(path));
+  const r = await authFetch(pathURL(path), { method: "DELETE" });
   if (r.ok) loadSecrets();
   else msg("Delete failed: " + r.status, true);
 }
@@ -204,7 +226,7 @@ $("#secret-form").addEventListener("submit", async (e) => {
   const path = $("#path").value.trim();
   const value = $("#value").value;
   if (!path) return;
-  const r = await api("PUT", pathURL(path), { value });
+  const r = await apiJSON("PUT", pathURL(path), { value });
   if (r.ok) {
     msg("Saved.", false);
     resetForm();
@@ -218,6 +240,79 @@ $("#secret-form").addEventListener("submit", async (e) => {
 $("#cancel").onclick = resetForm;
 $("#filter").addEventListener("input", renderSecrets);
 
-loadStatus();
-loadSecrets();
+// ---------- identities (admin only) ----------
+
+async function loadIdentities() {
+  const r = await authFetch("/v1/identities");
+  if (!r.ok) {
+    // 403 => not an admin; hide the panel.
+    $("#identities-card").hidden = true;
+    return;
+  }
+  const data = await r.json();
+  $("#identities-card").hidden = false;
+  const body = tbody("#identities");
+  body.innerHTML = "";
+  (data.identities || []).forEach((id) => {
+    const tr = document.createElement("tr");
+    const pol = id.admin
+      ? "—"
+      : (id.policies || []).map((p) => `${p.prefix || "*"}:${(p.caps || []).join("+")}`).join(", ");
+    tr.innerHTML =
+      `<td>${esc(id.name)}</td>` +
+      `<td>${id.admin ? "✓" : ""}</td>` +
+      `<td class="muted">${esc(pol)}</td>` +
+      `<td class="row-actions"></td>`;
+    const delBtn = document.createElement("button");
+    delBtn.textContent = "Delete";
+    delBtn.className = "danger";
+    delBtn.onclick = () => delIdentity(id.name);
+    tr.querySelector(".row-actions").appendChild(delBtn);
+    body.appendChild(tr);
+  });
+}
+
+async function delIdentity(name) {
+  if (!confirm("Delete identity " + name + " ?")) return;
+  const r = await authFetch("/v1/identities/" + encodeURIComponent(name), { method: "DELETE" });
+  if (r.ok) loadIdentities();
+}
+
+$("#identity-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = $("#id-name").value.trim();
+  if (!name) return;
+  const admin = $("#id-admin").checked;
+  const caps = [];
+  if ($("#cap-read").checked) caps.push("read");
+  if ($("#cap-write").checked) caps.push("write");
+  if ($("#cap-delete").checked) caps.push("delete");
+  const policies = admin ? [] : [{ prefix: $("#id-prefix").value.trim(), caps }];
+
+  const box = $("#id-token");
+  const r = await apiJSON("POST", "/v1/identities", { name, admin, policies });
+  if (r.status === 201) {
+    const { token: t } = await r.json();
+    box.hidden = false;
+    box.className = "token-box";
+    box.innerHTML = `New token for <b>${esc(name)}</b> (copy now — shown once):<br><code>${esc(t)}</code>`;
+    $("#id-name").value = "";
+    loadIdentities();
+  } else {
+    const j = await r.json().catch(() => ({}));
+    box.hidden = false;
+    box.className = "token-box err";
+    box.textContent = "Create failed: " + (j.error || r.status);
+  }
+});
+
+// ---------- boot ----------
+
+function refresh() {
+  loadStatus();
+  loadSecrets();
+  loadIdentities();
+}
+
+refresh();
 setInterval(loadStatus, 4000);

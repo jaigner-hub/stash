@@ -5,7 +5,7 @@ secret storage that is genuinely *easy* to stand up — no external database, no
 Redis, no Kubernetes. One Go binary that does it all, replicating state with
 embedded Raft.
 
-> **Status: milestone 4 — embedded web console.** This is a hobby project and is
+> **Status: milestone 5 — identity & access.** This is a hobby project and is
 > **not production-ready**. Do not trust it with real secrets yet. (For the
 > keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
 
@@ -118,6 +118,34 @@ file so restart/self-heal still works.
 In production the unseal key is the only thing you keep in SOPS, decrypted to
 tmpfs at deploy. That's the entire residual SOPS surface.
 
+## Identity & access
+
+API requests authenticate with a bearer token (`Authorization: Bearer <token>`
+or a `stash_token` cookie for the console). Each **identity** has policies:
+
+```
+policy = { prefix: "kg/web/", caps: ["read","write","delete"] }
+```
+
+A request is allowed if some policy's prefix matches the path and grants the
+capability. `admin` identities bypass policies and may manage other identities.
+`list` returns only the paths the caller can read.
+
+- **Root token** — bootstrap mints an admin `root` identity and prints its token
+  once. Use it to log into the console and to create scoped identities.
+- **Tokens are hashed at rest** (sha256); only the holder ever has the plaintext,
+  shown once at creation.
+- **Open mode** — if no identities exist yet (e.g. a cluster upgraded from M4),
+  the API is *open* (no auth) and logs a warning, so you're not locked out.
+  Creating the first identity flips on enforcement.
+
+```sh
+# create a read-only CI identity scoped to kg/web/*
+curl -H "Authorization: Bearer $ROOT" -X POST $API/v1/identities \
+  -d '{"name":"ci","admin":false,"policies":[{"prefix":"kg/web/","caps":["read"]}]}'
+# -> {"name":"ci","token":"stash-…"}   (shown once)
+```
+
 ## Web console
 
 Open `http://<node>:8200/` in a browser. The console is a dependency-free
@@ -145,7 +173,14 @@ internal/ui/assets/{index.html,style.css,app.js}  →  go:embed  →  served at 
 | `DELETE` | `/v1/secret/<path>`  | — | `204` (forwarded to leader) |
 | `POST`   | `/v1/cluster/join`   | `{"node_id","raft_addr","http_addr","secret"}` | `200` (secret-gated) |
 | `GET`    | `/v1/cluster/status` | — | `{"node_id","is_leader","sealed","leader_id","servers":[…]}` |
+| `GET`    | `/v1/identities`     | — | `{"identities":[…]}` (admin) |
+| `POST`   | `/v1/identities`     | `{"name","admin","policies":[…]}` | `{"name","token"}` (admin) |
+| `DELETE` | `/v1/identities/{name}` | — | `204` (admin) |
 | `GET`    | `/` and `/app.js`, `/style.css` | — | embedded web console |
+
+All `/v1/secret*`, `/v1/secrets`, `/v1/cluster/status`, and `/v1/identities`
+routes require a bearer token (unless the cluster is in open mode). `/v1/health`
+is always open; `/v1/cluster/join` is gated by the join secret instead.
 
 `<path>` may contain slashes (`kg/web/SECRET_KEY`).
 
@@ -158,7 +193,7 @@ and each later milestone now *feeds* it (audit view, history/diff, login).
 - [x] **M2 — HA**: embedded `hashicorp/raft` (voters + sealed witness), leader-forwarding, bootstrap.
 - [x] **M3 — easy join**: one-token pairing, auto address-detection, secret-gated join, restart from `cluster.json`.
 - [x] **M4 — Web UI v1**: embedded console (dependency-free, tailnet-gated) — view/add/edit/delete secrets, cluster health.
-- [ ] **M5 — identity & access**: machine-identity tokens (hashed at rest) + path-prefix ACLs; UI gains login.
+- [x] **M5 — identity & access**: bearer-token identities (hashed at rest) + path-prefix ACLs; root token; UI login + Identities panel; open-mode for upgrades.
 - [ ] **M6 — audit**: hash-chained append-only audit log (reads + writes) → Loki; UI gains an audit view.
 - [ ] **M7 — versioning**: keep last N versions per path; UI gains history/diff.
 - [ ] **M8 — agent**: `stash agent` renders secrets → tmpfs with last-good cache (reboot-during-outage self-heal).
@@ -167,6 +202,9 @@ and each later milestone now *feeds* it (audit view, history/diff, login).
 ## Security notes (read before trusting it)
 
 - Crypto uses only Go stdlib + `x/crypto` AEAD primitives — nothing hand-rolled.
+- Identity tokens are stored only as sha256 hashes; plaintext is shown once.
+  Tokens travel in plaintext over HTTP today — run on a trusted network/tailnet
+  until inter-node + client TLS lands (follow-up).
 - The unseal key never enters the Raft log. A keyed join token *does* carry it
   (by design, for one-value setup) — so the token is crown-jewel sensitive;
   `--no-key` avoids it. Join is gated by a per-cluster secret (constant-time

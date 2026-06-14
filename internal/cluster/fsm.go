@@ -15,11 +15,13 @@ import (
 type cmdOp string
 
 const (
-	opInit   cmdOp = "init"   // establish the wrapped DEK + canary
-	opPut    cmdOp = "put"    // store a pre-encrypted value blob
-	opDelete cmdOp = "delete" // remove a path
-	opMeta   cmdOp = "meta"   // record a node's API address
-	opConfig cmdOp = "config" // set cluster id + join secret
+	opInit           cmdOp = "init"      // establish the wrapped DEK + canary
+	opPut            cmdOp = "put"       // store a pre-encrypted value blob
+	opDelete         cmdOp = "delete"    // remove a path
+	opMeta           cmdOp = "meta"      // record a node's API address
+	opConfig         cmdOp = "config"    // set cluster id + join secret
+	opPutIdentity    cmdOp = "put_id"    // upsert an identity record
+	opDeleteIdentity cmdOp = "delete_id" // remove an identity
 )
 
 // command is one entry in the Raft log. Encryption happens once on the leader;
@@ -35,6 +37,9 @@ type command struct {
 	HTTPAddr   string `json:"http_addr,omitempty"`
 	ClusterID  string `json:"cluster_id,omitempty"`
 	Secret     string `json:"secret,omitempty"`
+
+	IdentityName   string `json:"identity_name,omitempty"`
+	IdentityRecord []byte `json:"identity_record,omitempty"`
 }
 
 // fsm is the Raft finite state machine: it applies committed commands to the
@@ -78,6 +83,10 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		f.joinSecret = c.Secret
 		f.mu.Unlock()
 		return nil
+	case opPutIdentity:
+		return f.store.PutIdentityRaw(c.IdentityName, c.IdentityRecord)
+	case opDeleteIdentity:
+		return f.store.DeleteIdentityRaw(c.IdentityName)
 	default:
 		return fmt.Errorf("stash/cluster: unknown op %q", c.Op)
 	}

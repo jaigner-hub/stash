@@ -178,7 +178,8 @@ func cmdServer(args []string) error {
 		if kek == nil {
 			return errors.New("-unseal-key is required when bootstrapping (it creates the data key)")
 		}
-		if err := node.Initialize(kek, 15*time.Second); err != nil {
+		rootToken, err := node.Initialize(kek, 15*time.Second)
+		if err != nil {
 			return fmt.Errorf("bootstrap init: %w", err)
 		}
 		id, secret := node.ClusterConfig()
@@ -190,6 +191,11 @@ func cmdServer(args []string) error {
 			return err
 		}
 		log.Info("bootstrapped cluster", "node", cfg.NodeID, "cluster", id)
+		if rootToken != "" {
+			fmt.Printf("\nroot token (admin — store it; shown only once):\n\n    %s\n\n", rootToken)
+			fmt.Fprintln(os.Stderr, "WARNING: the root token grants full access to all secrets. "+
+				"Use it to log into the console and to create scoped identities.")
+		}
 		printJoinToken(cfg.HTTPAddr, id, secret, kek)
 	}
 

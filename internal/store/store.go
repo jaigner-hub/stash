@@ -36,8 +36,9 @@ var (
 )
 
 var (
-	metaBucket    = []byte("meta")
-	secretsBucket = []byte("secrets")
+	metaBucket       = []byte("meta")
+	secretsBucket    = []byte("secrets")
+	identitiesBucket = []byte("identities")
 
 	keyWrappedDEK = []byte("wrapped_dek")
 	keyCanary     = []byte("canary")
@@ -70,7 +71,7 @@ func Open(path string) (*Store, error) {
 
 func ensureBuckets(db *bolt.DB) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{metaBucket, secretsBucket} {
+		for _, b := range [][]byte{metaBucket, secretsBucket, identitiesBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -207,6 +208,42 @@ func (s *Store) Exists(path string) (bool, error) {
 	}
 }
 
+// --- Identity records (token hashes + policies). Not encrypted (no plaintext
+// secret material), replicated like everything else, usable while sealed. ---
+
+// PutIdentityRaw stores an identity record (JSON) keyed by name.
+func (s *Store) PutIdentityRaw(name string, record []byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(identitiesBucket).Put([]byte(name), record)
+	})
+}
+
+// DeleteIdentityRaw removes an identity, returning ErrNotFound if absent.
+func (s *Store) DeleteIdentityRaw(name string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(identitiesBucket)
+		if b.Get([]byte(name)) == nil {
+			return ErrNotFound
+		}
+		return b.Delete([]byte(name))
+	})
+}
+
+// ListIdentitiesRaw returns all identity records keyed by name.
+func (s *Store) ListIdentitiesRaw() (map[string][]byte, error) {
+	out := map[string][]byte{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(identitiesBucket).ForEach(func(k, v []byte) error {
+			out[string(k)] = append([]byte(nil), v...)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PutMeta persists the wrapped DEK + canary. Used by the Raft FSM when applying
 // an init command, and by single-node Init. Idempotent.
 func (s *Store) PutMeta(wrappedDEK, canary []byte) error {
@@ -277,17 +314,24 @@ type Snapshot struct {
 	WrappedDEK []byte            `json:"wrapped_dek"`
 	Canary     []byte            `json:"canary"`
 	Secrets    map[string][]byte `json:"secrets"`
+	Identities map[string][]byte `json:"identities"`
 }
 
 // Export captures the full store state for a Raft snapshot.
 func (s *Store) Export() (*Snapshot, error) {
-	snap := &Snapshot{Secrets: map[string][]byte{}}
+	snap := &Snapshot{Secrets: map[string][]byte{}, Identities: map[string][]byte{}}
 	err := s.db.View(func(tx *bolt.Tx) error {
 		m := tx.Bucket(metaBucket)
 		snap.WrappedDEK = append([]byte(nil), m.Get(keyWrappedDEK)...)
 		snap.Canary = append([]byte(nil), m.Get(keyCanary)...)
-		return tx.Bucket(secretsBucket).ForEach(func(k, v []byte) error {
+		if err := tx.Bucket(secretsBucket).ForEach(func(k, v []byte) error {
 			snap.Secrets[string(k)] = append([]byte(nil), v...)
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.Bucket(identitiesBucket).ForEach(func(k, v []byte) error {
+			snap.Identities[string(k)] = append([]byte(nil), v...)
 			return nil
 		})
 	})
@@ -309,6 +353,18 @@ func (s *Store) Import(snap *Snapshot) error {
 		}
 		for k, v := range snap.Secrets {
 			if err := sb.Put([]byte(k), v); err != nil {
+				return err
+			}
+		}
+		if err := tx.DeleteBucket(identitiesBucket); err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
+			return err
+		}
+		ib, err := tx.CreateBucket(identitiesBucket)
+		if err != nil {
+			return err
+		}
+		for k, v := range snap.Identities {
+			if err := ib.Put([]byte(k), v); err != nil {
 				return err
 			}
 		}
