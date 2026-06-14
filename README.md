@@ -30,7 +30,8 @@ Each app box runs its own local `stash` node *and* a `stash agent`. The agent
 polls the local node and renders the secrets it may read into a tmpfs env file;
 the app just sources that file. Reads are served locally; writes are forwarded to
 the leader; a sealed witness provides the third Raft vote without ever being able
-to read a secret.
+to read a secret. Each node keeps its own audit log and ships it (best-effort) to
+Loki for one durable, queryable view across the cluster.
 
 ```mermaid
 flowchart TB
@@ -54,6 +55,10 @@ flowchart TB
     s2 -.->|"writes forwarded to leader"| s1
 
     admin["Web UI · CLI · curl"] -->|"HTTPS + bearer token"| s1
+
+    loki["Loki<br/>unified audit view"]
+    s1 -.->|"ship audit<br/>(best-effort)"| loki
+    s2 -.->|"ship audit"| loki
 ```
 
 ### Envelope encryption
@@ -117,20 +122,23 @@ sequenceDiagram
     participant A as stash agent
     participant S as stash node
     participant L as audit log
+    participant K as Loki
 
     Note over A,S: first poll (or after a change)
     A->>S: GET /v1/secret/kg/web/DB_PW
     S->>L: record read = ok
+    L-->>K: ship entry (best-effort)
     S-->>A: 200 {value} · ETag "v7"
 
     Note over A,S: steady polls — nothing changed
     A->>S: GET … If-None-Match "v7"
     S-->>A: 304 Not Modified
-    Note right of S: no body · no audit row
+    Note right of S: no body · no audit row · nothing shipped
 
     Note over A,S: a write bumps the version
     A->>S: GET … If-None-Match "v7"
     S->>L: record read = ok
+    L-->>K: ship entry
     S-->>A: 200 {value} · ETag "v8"
 ```
 
