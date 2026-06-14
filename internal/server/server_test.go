@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -126,6 +127,7 @@ func (f *fakeBackend) GetVersion(p string, seq uint64) ([]byte, error) {
 	}
 	return v, nil
 }
+func (f *fakeBackend) OutboundTLS() *tls.Config { return nil }
 
 func do(t *testing.T, h http.Handler, method, target string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()

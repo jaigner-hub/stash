@@ -27,9 +27,12 @@ const tokenPrefix = "stash1."
 // (--no-key) for witnesses and for any posture where the KEK stays in SOPS.
 type JoinToken struct {
 	ClusterID string `json:"cid"`
-	LeaderAPI string `json:"api"`           // e.g. http://10.0.0.1:8200
+	LeaderAPI string `json:"api"`           // e.g. https://10.0.0.1:8200
 	Secret    string `json:"sec"`           // cluster membership secret
 	UnsealKey string `json:"key,omitempty"` // base64 KEK; omitted for keyless tokens
+	// For TLS clusters, the CA (base64 PEM) so a joiner can issue its own leaf.
+	CACert string `json:"ca,omitempty"`
+	CAKey  string `json:"cak,omitempty"`
 }
 
 // Encode renders the token as a copy-pasteable string.
@@ -63,6 +66,9 @@ func DecodeToken(s string) (*JoinToken, error) {
 
 // HasKey reports whether the token carries an unseal key.
 func (t JoinToken) HasKey() bool { return t.UnsealKey != "" }
+
+// HasTLS reports whether the token carries CA material (a TLS cluster).
+func (t JoinToken) HasTLS() bool { return t.CACert != "" }
 
 // LocalConfig is a node's local cluster membership state, persisted next to the
 // data dir (cluster.json) so the node can mint further join tokens and so a

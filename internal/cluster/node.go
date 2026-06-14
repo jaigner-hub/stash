@@ -7,6 +7,7 @@ package cluster
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/jaigner-hub/stash/internal/pki"
 	"github.com/jaigner-hub/stash/internal/store"
 )
 
@@ -37,6 +39,11 @@ type Config struct {
 	DataDir       string // directory for raft logs/snapshots (and the store db)
 	Bootstrap     bool   // form a new single-node cluster if no state exists
 	Witness       bool   // this node has no key; it must never remain leader
+
+	// TLS: when CertPEM is set, Raft + API use mutual TLS. All three are PEM.
+	CACertPEM []byte
+	CertPEM   []byte
+	KeyPEM    []byte
 }
 
 // JoinRequest is the body of POST /v1/cluster/join.
@@ -74,9 +81,26 @@ func New(cfg Config, st *store.Store) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stash/cluster: resolve raft advertise addr: %w", err)
 	}
-	tn, err := raft.NewTCPTransport(cfg.RaftAddr, tcpAddr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		return nil, fmt.Errorf("stash/cluster: raft transport: %w", err)
+	var tn *raft.NetworkTransport
+	if len(cfg.CertPEM) > 0 {
+		serverCfg, err := pki.MutualServerConfig(cfg.CertPEM, cfg.KeyPEM, cfg.CACertPEM)
+		if err != nil {
+			return nil, fmt.Errorf("stash/cluster: raft server tls: %w", err)
+		}
+		clientCfg, err := pki.ClientConfig(cfg.CertPEM, cfg.KeyPEM, cfg.CACertPEM)
+		if err != nil {
+			return nil, fmt.Errorf("stash/cluster: raft client tls: %w", err)
+		}
+		sl, err := newTLSStreamLayer(cfg.RaftAddr, tcpAddr, serverCfg, clientCfg)
+		if err != nil {
+			return nil, fmt.Errorf("stash/cluster: raft tls transport: %w", err)
+		}
+		tn = raft.NewNetworkTransport(sl, 3, 10*time.Second, os.Stderr)
+	} else {
+		tn, err = raft.NewTCPTransport(cfg.RaftAddr, tcpAddr, 3, 10*time.Second, os.Stderr)
+		if err != nil {
+			return nil, fmt.Errorf("stash/cluster: raft transport: %w", err)
+		}
 	}
 
 	snaps, err := raft.NewFileSnapshotStore(cfg.DataDir, 2, os.Stderr)
@@ -384,8 +408,9 @@ func (n *Node) waitLeader(timeout time.Duration) error {
 }
 
 // RequestJoin asks the cluster at leaderURL to admit this node. The contacted
-// node forwards to the leader if needed.
-func RequestJoin(leaderURL, nodeID, raftAddr, httpAddr, secret string) error {
+// node forwards to the leader if needed. tlsCfg is used when leaderURL is https
+// (nil for plaintext clusters).
+func RequestJoin(leaderURL, nodeID, raftAddr, httpAddr, secret string, tlsCfg *tls.Config) error {
 	body, err := json.Marshal(JoinRequest{
 		NodeID: nodeID, RaftAddr: raftAddr, HTTPAddr: httpAddr, Secret: secret,
 	})
@@ -393,7 +418,11 @@ func RequestJoin(leaderURL, nodeID, raftAddr, httpAddr, secret string) error {
 		return err
 	}
 	url := strings.TrimRight(leaderURL, "/") + "/v1/cluster/join"
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	client := http.DefaultClient
+	if tlsCfg != nil {
+		client = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+	}
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

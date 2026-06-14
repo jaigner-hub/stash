@@ -199,6 +199,13 @@ cache to `-out` and exits 0 (logging a warning). With no cache and an
 unreachable cluster, it fails loudly. For self-heal, put `-out` on tmpfs and
 `-cache` on persistent disk.
 
+**Picking up changes.** With `-interval`, the agent re-renders on that schedule
+and rewrites `-out` **only when a value actually changed** (no churn otherwise).
+Because most apps read their `.env` once at startup, rewriting the file isn't
+enough — so `-on-change "<cmd>"` runs a command after a real change (e.g.
+`systemctl reload keygrip-web`) to make the app pick up the new value. Use `-ca`
+to trust a TLS cluster's CA.
+
 ## Web console
 
 Open `http://<node>:8200/` in a browser. The console is a dependency-free
@@ -252,14 +259,19 @@ and each later milestone now *feeds* it (audit view, history/diff, login).
 - [x] **M6 — audit**: per-node hash-chained append-only audit log (reads, writes, denials, identity changes); admin API + UI panel with chain-integrity check.
 - [x] **M7 — versioning**: keep last N versions per path (replicated, pruned); read any version; UI History view with view + restore.
 - [x] **M8 — agent**: `stash agent` renders secrets to a file from a template with a last-good cache (reboot-during-outage self-heal).
-- [ ] follow-ups: join-secret rotation (`stash token rotate`), inter-node mTLS (CA fingerprint in token), Tailscale auto-discovery, ship audit log to Loki.
+- [x] **inter-node mTLS**: stash-as-CA (in the join token), mutual-TLS Raft + API forwarding, HTTPS API (default on; `-no-tls` for dev).
+- [x] **agent reload**: change-detection + `-on-change` hook so apps pick up rotated secrets.
+- [ ] follow-ups: join-secret rotation (`stash token rotate`), Tailscale auto-discovery, ship audit log to Loki, persistent units (systemd/NixOS).
 
 ## Security notes (read before trusting it)
 
 - Crypto uses only Go stdlib + `x/crypto` AEAD primitives — nothing hand-rolled.
 - Identity tokens are stored only as sha256 hashes; plaintext is shown once.
-  Tokens travel in plaintext over HTTP today — run on a trusted network/tailnet
-  until inter-node + client TLS lands (follow-up).
+- **TLS is on by default** (`-no-tls` to opt out for local dev). stash runs its
+  own CA (in the join token); Raft + node-to-node API forwarding use mutual TLS,
+  and the API is HTTPS. Browsers use TLS + bearer token (front with Tailscale
+  Serve for a clean cert); the agent trusts the CA via `-ca`. Client-cert mTLS
+  for end users is intentionally not required (bad browser UX).
 - The unseal key never enters the Raft log. A keyed join token *does* carry it
   (by design, for one-value setup) — so the token is crown-jewel sensitive;
   `--no-key` avoids it. Join is gated by a per-cluster secret (constant-time

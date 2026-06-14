@@ -40,31 +40,54 @@ func Render(tmpl string, fetch Fetcher) (string, error) {
 	return buf.String(), nil
 }
 
-// RenderOnce renders the template and writes Out + Cache (both 0600). If the
-// render fails (e.g. the cluster is unreachable) but a cache exists, it copies
-// the cache to Out and returns fellBack=true with a nil error. It returns an
-// error only when it can neither render nor fall back.
-func RenderOnce(cfg Config, fetch Fetcher) (fellBack bool, err error) {
+// Result reports what a render did.
+type Result struct {
+	Changed  bool // the rendered content differs from the last successful render
+	FellBack bool // the cluster was unreachable; the last-good cache was served
+}
+
+// RenderOnce renders the template and writes Out + Cache (both 0600), but only
+// when the content actually changed (or the file is missing) — so a steady poll
+// doesn't churn the file or fire reload hooks needlessly. If the render fails
+// (e.g. cluster unreachable) but a cache exists, it serves the cache to Out and
+// returns FellBack=true with a nil error. It errors only when it can neither
+// render nor fall back.
+func RenderOnce(cfg Config, fetch Fetcher) (Result, error) {
 	tmpl, err := os.ReadFile(cfg.Template)
 	if err != nil {
-		return false, fmt.Errorf("agent: read template: %w", err)
+		return Result{}, fmt.Errorf("agent: read template: %w", err)
 	}
 	rendered, rerr := Render(string(tmpl), fetch)
 	if rerr != nil {
 		cached, cerr := os.ReadFile(cfg.Cache)
 		if cerr != nil {
-			return false, fmt.Errorf("%w (and no last-good cache at %s)", rerr, cfg.Cache)
+			return Result{}, fmt.Errorf("%w (and no last-good cache at %s)", rerr, cfg.Cache)
 		}
-		if err := os.WriteFile(cfg.Out, cached, 0o600); err != nil {
-			return false, fmt.Errorf("agent: write from cache: %w", err)
+		if cur, _ := os.ReadFile(cfg.Out); !bytes.Equal(cur, cached) {
+			if err := os.WriteFile(cfg.Out, cached, 0o600); err != nil {
+				return Result{}, fmt.Errorf("agent: write from cache: %w", err)
+			}
 		}
-		return true, nil
+		return Result{FellBack: true}, nil
 	}
-	if err := os.WriteFile(cfg.Out, []byte(rendered), 0o600); err != nil {
-		return false, fmt.Errorf("agent: write out: %w", err)
+
+	out := []byte(rendered)
+	prev, _ := os.ReadFile(cfg.Cache) // last successful render
+	changed := !bytes.Equal(out, prev)
+	if changed || !fileExists(cfg.Out) {
+		if err := os.WriteFile(cfg.Out, out, 0o600); err != nil {
+			return Result{}, fmt.Errorf("agent: write out: %w", err)
+		}
 	}
-	if err := os.WriteFile(cfg.Cache, []byte(rendered), 0o600); err != nil {
-		return false, fmt.Errorf("agent: write cache: %w", err)
+	if changed || !fileExists(cfg.Cache) {
+		if err := os.WriteFile(cfg.Cache, out, 0o600); err != nil {
+			return Result{}, fmt.Errorf("agent: write cache: %w", err)
+		}
 	}
-	return false, nil
+	return Result{Changed: changed}, nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }

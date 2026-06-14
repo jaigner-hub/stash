@@ -35,9 +35,9 @@ func TestRenderOnceWritesAndCaches(t *testing.T) {
 	os.WriteFile(tmpl, []byte("K={{secret \"p\"}}\n"), 0o600)
 
 	fetch := func(string) (string, error) { return "v1", nil }
-	fell, err := RenderOnce(Config{Template: tmpl, Out: out, Cache: cache}, fetch)
-	if err != nil || fell {
-		t.Fatalf("render: fell=%v err=%v", fell, err)
+	res, err := RenderOnce(Config{Template: tmpl, Out: out, Cache: cache}, fetch)
+	if err != nil || res.FellBack || !res.Changed {
+		t.Fatalf("render: %+v err=%v", res, err)
 	}
 	if b, _ := os.ReadFile(out); string(b) != "K=v1\n" {
 		t.Fatalf("out = %q", b)
@@ -63,15 +63,44 @@ func TestRenderOnceFallsBackToCache(t *testing.T) {
 
 	// Now the cluster is unreachable: should fall back to cache, no error.
 	down := func(string) (string, error) { return "", errors.New("down") }
-	fell, err := RenderOnce(Config{Template: tmpl, Out: out, Cache: cache}, down)
+	res, err := RenderOnce(Config{Template: tmpl, Out: out, Cache: cache}, down)
 	if err != nil {
 		t.Fatalf("expected cache fallback, got err %v", err)
 	}
-	if !fell {
-		t.Fatal("expected fellBack=true")
+	if !res.FellBack {
+		t.Fatal("expected FellBack=true")
 	}
 	if b, _ := os.ReadFile(out); string(b) != "K=good\n" {
 		t.Fatalf("out after fallback = %q", b)
+	}
+}
+
+func TestRenderOnceChangeDetection(t *testing.T) {
+	dir := t.TempDir()
+	tmpl := filepath.Join(dir, "t.tmpl")
+	out := filepath.Join(dir, "out.env")
+	cache := filepath.Join(dir, "out.last")
+	os.WriteFile(tmpl, []byte("K={{secret \"p\"}}\n"), 0o600)
+	cfg := Config{Template: tmpl, Out: out, Cache: cache}
+
+	val := "one"
+	fetch := func(string) (string, error) { return val, nil }
+
+	r1, _ := RenderOnce(cfg, fetch)
+	if !r1.Changed {
+		t.Fatal("first render should be Changed")
+	}
+	r2, _ := RenderOnce(cfg, fetch) // same value
+	if r2.Changed {
+		t.Fatal("re-render of unchanged value should NOT be Changed")
+	}
+	val = "two"
+	r3, _ := RenderOnce(cfg, fetch) // new value
+	if !r3.Changed {
+		t.Fatal("render after value change should be Changed")
+	}
+	if b, _ := os.ReadFile(out); string(b) != "K=two\n" {
+		t.Fatalf("out = %q", b)
 	}
 }
 

@@ -4,6 +4,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -82,6 +83,9 @@ type Backend interface {
 	ListIdentities() ([]cluster.Identity, error)
 	ListVersions(path string) ([]store.VersionMeta, error)
 	GetVersion(path string, seq uint64) ([]byte, error)
+	// OutboundTLS is the client TLS config for forwarding to the leader (nil for
+	// plaintext clusters).
+	OutboundTLS() *tls.Config
 }
 
 type server struct {
@@ -525,6 +529,9 @@ func (s *server) proxyToLeader(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	if cfg := s.backend.OutboundTLS(); cfg != nil {
+		proxy.Transport = &http.Transport{TLSClientConfig: cfg}
+	}
 	director := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		director(req)

@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -39,6 +41,7 @@ import (
 	"github.com/jaigner-hub/stash/internal/audit"
 	"github.com/jaigner-hub/stash/internal/cluster"
 	"github.com/jaigner-hub/stash/internal/crypto"
+	"github.com/jaigner-hub/stash/internal/pki"
 	"github.com/jaigner-hub/stash/internal/server"
 	"github.com/jaigner-hub/stash/internal/store"
 )
@@ -131,6 +134,7 @@ func cmdServer(args []string) error {
 	raftAddr := fs.String("raft-addr", "0.0.0.0:8300", "host:port for the raft transport to bind")
 	advertise := fs.String("advertise-http", "", "API URL peers use to reach this node (default: detected)")
 	bootstrap := fs.Bool("bootstrap", false, "form a new cluster (first node only)")
+	noTLS := fs.Bool("no-tls", false, "disable mutual TLS (insecure; local dev only). TLS is on by default")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -152,6 +156,8 @@ func cmdServer(args []string) error {
 	// the operator need only re-supply the data dir + key.
 	cfg := cluster.Config{DataDir: *dir, Bootstrap: *bootstrap}
 	listenAddr := *listen
+	var advHost string
+	recovered := false
 	if lc, err := cluster.ReadLocalConfig(*dir); err == nil && !*bootstrap {
 		cfg.NodeID = lc.NodeID
 		cfg.RaftAddr = lc.RaftBind
@@ -160,15 +166,32 @@ func cmdServer(args []string) error {
 		if lc.Listen != "" {
 			listenAddr = lc.Listen
 		}
+		advHost, _, _ = net.SplitHostPort(lc.RaftAdvertise)
+		recovered = true
 		log.Info("recovered node config", "node", cfg.NodeID, "raft", cfg.RaftAdvertise)
 	} else {
-		advHost := advertiseHost(*advertise, listenAddr)
+		advHost = advertiseHost(*advertise, listenAddr)
 		cfg.NodeID = orHostname(*nodeID)
 		cfg.RaftAddr = *raftAddr
 		cfg.RaftAdvertise = net.JoinHostPort(advHost, portOf(*raftAddr))
-		cfg.HTTPAddr = "http://" + net.JoinHostPort(advHost, portOf(listenAddr))
 	}
 	cfg.Witness = kek == nil // restarted witness (no key) must not remain leader
+
+	// TLS: generate (bootstrap -tls), adopt (cluster.json's CA on restart), and
+	// always issue this node a fresh leaf for its addresses.
+	caCert, caKey, cert, key, err := setupTLS(*dir, !*noTLS, nil, nil, cfg.NodeID,
+		[]string{advHost, "127.0.0.1", "localhost"})
+	if err != nil {
+		return err
+	}
+	cfg.CACertPEM, cfg.CertPEM, cfg.KeyPEM = caCert, cert, key
+	if !recovered {
+		scheme := "http"
+		if len(cert) > 0 {
+			scheme = "https"
+		}
+		cfg.HTTPAddr = scheme + "://" + net.JoinHostPort(advHost, portOf(listenAddr))
+	}
 
 	st, err := store.Open(dbPath(*dir))
 	if err != nil {
@@ -204,7 +227,7 @@ func cmdServer(args []string) error {
 			fmt.Fprintln(os.Stderr, "WARNING: the root token grants full access to all secrets. "+
 				"Use it to log into the console and to create scoped identities.")
 		}
-		printJoinToken(cfg.HTTPAddr, id, secret, kek)
+		printJoinToken(cfg.HTTPAddr, id, secret, kek, caCert, caKey)
 	}
 
 	aud, err := audit.Open(filepath.Join(*dir, "audit.db"), cfg.NodeID)
@@ -253,9 +276,29 @@ func cmdJoin(args []string) error {
 	id := orHostname(*nodeID)
 	raftBind := fmt.Sprintf("0.0.0.0:%d", *raftPort)
 	raftAdv := net.JoinHostPort(ip, fmt.Sprintf("%d", *raftPort))
-	httpAdv := "http://" + net.JoinHostPort(ip, portOf(*listen))
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	// TLS material from the token's CA (if it's a TLS cluster).
+	var tokenCACert, tokenCAKey []byte
+	if token.HasTLS() {
+		if tokenCACert, err = base64.StdEncoding.DecodeString(token.CACert); err != nil {
+			return fmt.Errorf("decode CA from token: %w", err)
+		}
+		if tokenCAKey, err = base64.StdEncoding.DecodeString(token.CAKey); err != nil {
+			return fmt.Errorf("decode CA key from token: %w", err)
+		}
+	}
+	caCert, _, cert, key, err := setupTLS(*dir, false, tokenCACert, tokenCAKey, id,
+		[]string{ip, "127.0.0.1", "localhost"})
+	if err != nil {
+		return err
+	}
+	scheme := "http"
+	if len(cert) > 0 {
+		scheme = "https"
+	}
+	httpAdv := scheme + "://" + net.JoinHostPort(ip, portOf(*listen))
 
 	// Materialize the unseal key from the token (unless witness / --no-key).
 	var kek []byte
@@ -285,7 +328,8 @@ func cmdJoin(args []string) error {
 
 	node, err := cluster.New(cluster.Config{
 		NodeID: id, RaftAddr: raftBind, RaftAdvertise: raftAdv, HTTPAddr: httpAdv, DataDir: *dir,
-		Witness: kek == nil, // no key => witness; must not remain leader
+		Witness:   kek == nil, // no key => witness; must not remain leader
+		CACertPEM: caCert, CertPEM: cert, KeyPEM: key,
 	}, st)
 	if err != nil {
 		return err
@@ -299,7 +343,13 @@ func cmdJoin(args []string) error {
 		return err
 	}
 
-	if err := cluster.RequestJoin(token.LeaderAPI, id, raftAdv, httpAdv, token.Secret); err != nil {
+	var joinTLS *tls.Config
+	if len(cert) > 0 {
+		if joinTLS, err = pki.ClientConfig(cert, key, caCert); err != nil {
+			return err
+		}
+	}
+	if err := cluster.RequestJoin(token.LeaderAPI, id, raftAdv, httpAdv, token.Secret, joinTLS); err != nil {
 		return fmt.Errorf("join %s: %w", token.LeaderAPI, err)
 	}
 	log.Info("joined cluster", "leader", token.LeaderAPI, "node", id, "addr", raftAdv)
@@ -326,6 +376,15 @@ func cmdToken(args []string) error {
 		return fmt.Errorf("read cluster config (run on a bootstrapped/joined node): %w", err)
 	}
 	token := cluster.JoinToken{ClusterID: lc.ClusterID, LeaderAPI: lc.LeaderAPI, Secret: lc.Secret}
+	// Bundle the CA so the joiner can issue its own leaf (TLS clusters).
+	if caCert, err := os.ReadFile(filepath.Join(*dir, "ca.crt")); err == nil {
+		caKey, err := os.ReadFile(filepath.Join(*dir, "ca.key"))
+		if err != nil {
+			return fmt.Errorf("read CA key: %w", err)
+		}
+		token.CACert = base64.StdEncoding.EncodeToString(caCert)
+		token.CAKey = base64.StdEncoding.EncodeToString(caKey)
+	}
 	if !*noKey {
 		path := *keyFile
 		if path == "" {
@@ -356,6 +415,8 @@ func cmdAgent(args []string) error {
 	out := fs.String("out", "", "output file, typically on tmpfs (required)")
 	cache := fs.String("cache", "", "last-good cache on persistent disk (default <out>.last)")
 	interval := fs.Duration("interval", 0, "re-render every interval; 0 = render once and exit")
+	ca := fs.String("ca", "", "CA cert file to trust the stash server (for https / TLS clusters)")
+	onChange := fs.String("on-change", "", "shell command to run after the output changes (e.g. reload the app)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -371,6 +432,19 @@ func cmdAgent(args []string) error {
 		cachePath = *out + ".last"
 	}
 
+	httpClient := http.DefaultClient
+	if *ca != "" {
+		caPEM, err := os.ReadFile(*ca)
+		if err != nil {
+			return fmt.Errorf("read ca: %w", err)
+		}
+		tcfg, err := pki.CAOnlyConfig(caPEM)
+		if err != nil {
+			return err
+		}
+		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: tcfg}}
+	}
+
 	base := strings.TrimRight(*api, "/")
 	fetch := func(path string) (string, error) {
 		segs := strings.Split(path, "/")
@@ -384,7 +458,7 @@ func cmdAgent(args []string) error {
 		if tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return "", err
 		}
@@ -405,14 +479,21 @@ func cmdAgent(args []string) error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	renderOnce := func() error {
-		fell, err := agent.RenderOnce(cfg, fetch)
+		res, err := agent.RenderOnce(cfg, fetch)
 		switch {
 		case err != nil:
 			return err
-		case fell:
+		case res.FellBack:
 			log.Warn("cluster unreachable; served last-good cache", "out", *out)
+		case res.Changed:
+			log.Info("secrets changed; rewrote output", "out", *out)
+			if *onChange != "" {
+				if err := runHook(*onChange); err != nil {
+					log.Error("on-change hook failed", "err", err)
+				}
+			}
 		default:
-			log.Info("rendered secrets", "out", *out)
+			log.Info("secrets unchanged", "out", *out)
 		}
 		return nil
 	}
@@ -460,13 +541,27 @@ func serve(node *cluster.Node, auditor server.Auditor, listen string, kek []byte
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
+	tlsCfg := node.ServerTLSConfig()
+	if tlsCfg != nil {
+		httpSrv.TLSConfig = tlsCfg
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("stash listening", "addr", listen)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		scheme := "http"
+		if tlsCfg != nil {
+			scheme = "https"
+		}
+		log.Info("stash listening", "addr", listen, "scheme", scheme)
+		var err error
+		if tlsCfg != nil {
+			err = httpSrv.ListenAndServeTLS("", "") // certs come from TLSConfig
+		} else {
+			err = httpSrv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	}()
@@ -481,10 +576,14 @@ func serve(node *cluster.Node, auditor server.Auditor, listen string, kek []byte
 	}
 }
 
-func printJoinToken(api, id, secret string, kek []byte) {
+func printJoinToken(api, id, secret string, kek, caCert, caKey []byte) {
 	tok := cluster.JoinToken{ClusterID: id, LeaderAPI: api, Secret: secret}
 	if kek != nil {
 		tok.UnsealKey = base64.StdEncoding.EncodeToString(kek)
+	}
+	if len(caCert) > 0 {
+		tok.CACert = base64.StdEncoding.EncodeToString(caCert)
+		tok.CAKey = base64.StdEncoding.EncodeToString(caKey)
 	}
 	enc, err := tok.Encode()
 	if err != nil {
@@ -494,6 +593,60 @@ func printJoinToken(api, id, secret string, kek []byte) {
 	fmt.Printf("\nTo add a node, run on the new box:\n\n    stash join %s\n\n", enc)
 	fmt.Fprintln(os.Stderr, "WARNING: this token contains the master unseal key — treat it like a password; "+
 		"prefer your tailnet and don't paste it into shared logs. Use `stash token --no-key` for a witness.")
+}
+
+// setupTLS resolves this node's TLS material. It adopts a CA from the token
+// (join), an existing CA in the data dir (restart), or generates one (bootstrap
+// when enable is true), then issues a fresh leaf for hosts. Returns all-nil when
+// TLS is off. The CA cert+key are persisted to the data dir (0600).
+func setupTLS(dir string, enable bool, tokenCACert, tokenCAKey []byte, cn string, hosts []string) (caCert, caKey, cert, key []byte, err error) {
+	caPath := filepath.Join(dir, "ca.crt")
+	caKeyPath := filepath.Join(dir, "ca.key")
+	switch {
+	case len(tokenCACert) > 0: // joining a TLS cluster
+		caCert, caKey = tokenCACert, tokenCAKey
+		if err = os.WriteFile(caPath, caCert, 0o600); err != nil {
+			return
+		}
+		if err = os.WriteFile(caKeyPath, caKey, 0o600); err != nil {
+			return
+		}
+	case fileExists(caPath): // restart of a TLS node
+		if caCert, err = os.ReadFile(caPath); err != nil {
+			return
+		}
+		if caKey, err = os.ReadFile(caKeyPath); err != nil {
+			return
+		}
+	case enable: // bootstrap with TLS
+		if caCert, caKey, err = pki.GenerateCA(); err != nil {
+			return
+		}
+		if err = os.WriteFile(caPath, caCert, 0o600); err != nil {
+			return
+		}
+		if err = os.WriteFile(caKeyPath, caKey, 0o600); err != nil {
+			return
+		}
+	default:
+		return nil, nil, nil, nil, nil // TLS disabled
+	}
+	cert, key, err = pki.IssueCert(caCert, caKey, cn, hosts)
+	return
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// runHook runs a shell command after the agent's output changed (e.g. to reload
+// or restart the consuming app).
+func runHook(cmd string) error {
+	c := exec.Command("sh", "-c", cmd)
+	c.Stdout = os.Stderr
+	c.Stderr = os.Stderr
+	return c.Run()
 }
 
 func readKey(path string) ([]byte, error) {
