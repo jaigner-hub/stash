@@ -246,9 +246,13 @@ Deleting a secret also clears its version history.
 ## Audit log
 
 Every secret read/write/delete/list and identity change is recorded in a
-per-node, append-only, **hash-chained** audit log (each entry embeds the prior
-entry's hash, so any edit/insert/delete is detectable). Denied attempts are
-logged too, with the identity, action, path, and result.
+per-node, append-only, **hash-chained and Ed25519-signed** audit log (each entry
+embeds the prior entry's hash, so any edit/insert/delete is detectable, and each
+is signed by the node's persistent key so a rewritten entry can't be
+re-chained without the key). Denied attempts are logged too, with the identity,
+action, path, and result. The signing key lives at `<data>/audit.key`
+(generated on first start); its public half can verify the log — or its Loki
+copy — without trusting the node.
 
 It's intentionally **per-node** — each node logs the operations it actually
 served (reads are served locally, so only a per-node log captures them) — and
@@ -264,6 +268,19 @@ at a Loki push endpoint — `-audit-loki http://loki:3100` (or `$STASH_AUDIT_LOK
 Loki for one durable, queryable view across the cluster. It's **best-effort**: the
 local hash-chained `audit.db` stays the source of truth, so a Loki outage just
 pauses shipping — nothing blocks and no audited operation is lost.
+
+**Trusted timestamps (anchoring).** Hash-chaining + signatures stop an *outsider*,
+but a malicious key holder who also controls the clock could rewrite and re-sign
+the whole log with fabricated times. Point a node at an RFC 3161 Time-Stamp
+Authority — `-audit-tsa http://timestamp.digicert.com` (or `$STASH_AUDIT_TSA`),
+with `-audit-anchor-interval` (default 1h) — and it periodically sends just the
+**chain head hash** (never secret contents) to the TSA, storing the signed token.
+Because the chain is hash-linked, anchoring the head proves every prior entry
+existed *no later than* that timestamp; the cadence sets the backdating
+resolution. Verify offline with `stash audit verify` (chain + signatures +
+anchors against the TSA's root; system roots by default, or `-tsa-roots <pem>`).
+See `AUDIT-TIMESTAMPING.md` for the full design, threat model, and what anchoring
+does and doesn't defend against.
 
 ## Agent (render to file + self-heal)
 

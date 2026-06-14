@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -68,6 +69,8 @@ func main() {
 		err = cmdToken(os.Args[2:])
 	case "agent":
 		err = cmdAgent(os.Args[2:])
+	case "audit":
+		err = cmdAudit(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -93,6 +96,7 @@ usage:
   stash token  [--no-key] [flags]          mint another join token
   stash agent  -auto -prefix P -out O      render every readable secret to a file (KEY=value)
   stash agent  -template T -out O [flags]   render secrets via a template (last-good cache)
+  stash audit  verify [flags]              verify the local audit chain + trusted-timestamp anchors
   stash version                            print the build version
 
 run "stash <command> -h" for command flags.
@@ -143,6 +147,8 @@ func cmdServer(args []string) error {
 	bootstrap := fs.Bool("bootstrap", false, "form a new cluster (first node only)")
 	noTLS := fs.Bool("no-tls", false, "disable mutual TLS (insecure; local dev only). TLS is on by default")
 	auditLoki := fs.String("audit-loki", os.Getenv("STASH_AUDIT_LOKI"), "ship the audit log to this Loki base URL (e.g. http://loki:3100); also $STASH_AUDIT_LOKI")
+	auditTSA := fs.String("audit-tsa", os.Getenv("STASH_AUDIT_TSA"), "anchor the audit head to this RFC 3161 TSA URL for trusted timestamps; also $STASH_AUDIT_TSA")
+	auditAnchorEvery := fs.Duration("audit-anchor-interval", time.Hour, "how often to anchor the audit head to the TSA (sets backdating resolution)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -238,14 +244,26 @@ func cmdServer(args []string) error {
 		printJoinToken(cfg.HTTPAddr, id, secret, kek, caCert, caKey)
 	}
 
-	aud, err := audit.Open(filepath.Join(*dir, "audit.db"), cfg.NodeID)
+	aud, err := openAudit(*dir, cfg.NodeID)
 	if err != nil {
 		return err
 	}
 	defer aud.Close()
 	streamAuditToLoki(aud, cfg.NodeID, *auditLoki, log)
+	startAuditAnchoring(context.Background(), aud, *auditTSA, *auditAnchorEvery, log)
 
 	return serve(node, aud, listenAddr, kek, log)
+}
+
+// openAudit opens the per-node audit log with per-entry Ed25519 signing enabled,
+// loading (or first-time creating) the node's stable signing key alongside the
+// log in the data dir.
+func openAudit(dir, node string) (*audit.Log, error) {
+	key, err := audit.LoadOrCreateKey(filepath.Join(dir, "audit.key"))
+	if err != nil {
+		return nil, err
+	}
+	return audit.Open(filepath.Join(dir, "audit.db"), node, audit.WithSigningKey(key))
 }
 
 // streamAuditToLoki ships each new audit entry to Loki when a URL is configured.
@@ -258,6 +276,148 @@ func streamAuditToLoki(aud *audit.Log, node, lokiURL string, log *slog.Logger) {
 	}
 	aud.Stream(newLokiShipper(lokiURL, node, nil, log).ship)
 	log.Info("shipping audit log to Loki", "url", lokiURL)
+}
+
+// startAuditAnchoring periodically anchors the audit chain head to an RFC 3161
+// TSA when one is configured (feature flag; off by default). It stamps once at
+// startup so existing history gets an upper bound immediately, then on every
+// interval. Best-effort: a failed stamp is logged and retried next tick; the
+// local log stays the source of truth. The anchor cadence sets the backdating
+// resolution. Only the 32-byte head hash leaves the host.
+func startAuditAnchoring(ctx context.Context, aud *audit.Log, tsaURL string, interval time.Duration, log *slog.Logger) {
+	if tsaURL == "" {
+		return
+	}
+	anchorer := &audit.TSAAnchorer{URL: tsaURL}
+	anchor := func() {
+		c, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		anc, err := aud.Anchor(c, anchorer)
+		switch {
+		case err != nil:
+			log.Warn("audit anchoring failed", "err", err)
+		case anc != nil:
+			log.Info("anchored audit log", "head_seq", anc.HeadSeq, "time", anc.Time)
+		}
+	}
+	go func() {
+		anchor()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				anchor()
+			}
+		}
+	}()
+	log.Info("anchoring audit log to TSA", "url", tsaURL, "interval", interval)
+}
+
+// cmdAudit handles "stash audit verify": chain (+ signature) integrity and
+// trusted-timestamp anchor verification of the local audit.db. It is read-only
+// and offline — anchor proofs verify against pinned/system roots with no network.
+func cmdAudit(args []string) error {
+	if len(args) == 0 || args[0] != "verify" {
+		return errors.New("usage: stash audit verify [-data DIR] [-tsa-roots FILE]")
+	}
+	fs := flag.NewFlagSet("audit verify", flag.ExitOnError)
+	dir := fs.String("data", "./data", "data directory holding audit.db")
+	tsaRoots := fs.String("tsa-roots", "", "PEM file of trusted TSA root cert(s) (default: system roots)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	// Use the signing key for full signature verification if it sits beside the
+	// db; otherwise verify the chain only (e.g. on a copy shipped off-host).
+	var opts []audit.Option
+	signed := "chain only (audit.key not present)"
+	if keyPath := filepath.Join(*dir, "audit.key"); fileExists(keyPath) {
+		key, err := audit.LoadOrCreateKey(keyPath)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, audit.WithSigningKey(key))
+		signed = "chain + signatures"
+	}
+	aud, err := audit.Open(filepath.Join(*dir, "audit.db"), "", opts...)
+	if err != nil {
+		return err
+	}
+	defer aud.Close()
+
+	intact, count, err := aud.Verify()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("chain: %s over %d entries (%s)\n", verdict(intact), count, signed)
+
+	roots, err := loadRoots(*tsaRoots)
+	if err != nil {
+		return err
+	}
+	results, err := aud.VerifyAnchors(roots)
+	if err != nil {
+		return err
+	}
+	if len(results) == 0 {
+		fmt.Println("anchors: none recorded (anchoring disabled or not yet run)")
+		if !intact {
+			return errors.New("audit verification failed")
+		}
+		return nil
+	}
+	allOK := true
+	var upper time.Time
+	for _, r := range results {
+		if r.OK {
+			fmt.Printf("anchor @ seq %d: OK — existed by %s\n", r.HeadSeq, r.Time.UTC().Format(time.RFC3339))
+			if upper.IsZero() || r.Time.Before(upper) {
+				upper = r.Time
+			}
+		} else {
+			allOK = false
+			fmt.Printf("anchor @ seq %d: FAILED — %s\n", r.HeadSeq, r.Err)
+		}
+	}
+	if !upper.IsZero() {
+		fmt.Printf("proven: the log up to its anchored head existed by %s\n", upper.UTC().Format(time.RFC3339))
+	}
+	if !intact || !allOK {
+		return errors.New("audit verification failed")
+	}
+	fmt.Println("OK: chain intact and all anchors verified")
+	return nil
+}
+
+func verdict(ok bool) string {
+	if ok {
+		return "intact"
+	}
+	return "BROKEN"
+}
+
+// loadRoots returns the TSA trust pool: the PEM file at path, or the system
+// roots when path is empty (DigiCert's timestamping root is in the system store).
+func loadRoots(path string) (*x509.CertPool, error) {
+	if path == "" {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("load system roots: %w", err)
+		}
+		return pool, nil
+	}
+	der, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(der) {
+		return nil, fmt.Errorf("no certificates found in %s", path)
+	}
+	return pool, nil
 }
 
 func cmdJoin(args []string) error {
@@ -273,6 +433,8 @@ func cmdJoin(args []string) error {
 	keyOut := fs.String("unseal-key-out", "", "where to store the unseal key from the token (default: <data>/unseal.key)")
 	noKey := fs.Bool("no-key", false, "ignore any key in the token and join as a sealed witness")
 	auditLoki := fs.String("audit-loki", os.Getenv("STASH_AUDIT_LOKI"), "ship the audit log to this Loki base URL (e.g. http://loki:3100); also $STASH_AUDIT_LOKI")
+	auditTSA := fs.String("audit-tsa", os.Getenv("STASH_AUDIT_TSA"), "anchor the audit head to this RFC 3161 TSA URL for trusted timestamps; also $STASH_AUDIT_TSA")
+	auditAnchorEvery := fs.Duration("audit-anchor-interval", time.Hour, "how often to anchor the audit head to the TSA (sets backdating resolution)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -376,12 +538,13 @@ func cmdJoin(args []string) error {
 	}
 	log.Info("joined cluster", "leader", token.LeaderAPI, "node", id, "addr", raftAdv)
 
-	aud, err := audit.Open(filepath.Join(*dir, "audit.db"), id)
+	aud, err := openAudit(*dir, id)
 	if err != nil {
 		return err
 	}
 	defer aud.Close()
 	streamAuditToLoki(aud, id, *auditLoki, log)
+	startAuditAnchoring(context.Background(), aud, *auditTSA, *auditAnchorEvery, log)
 
 	return serve(node, aud, *listen, kek, log)
 }

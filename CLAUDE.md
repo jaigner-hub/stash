@@ -30,10 +30,12 @@ make run-demo   # build + run a throwaway single-node cluster (Ctrl-C to stop)
   except `internal/cluster` (real Raft, ~10–12s).
 - **`make release` (static, `CGO_ENABLED=0`) is mandatory for deploys** — a plain
   `make build` is glibc-dynamic and won't run on the NixOS witness node.
-- Standard library + four deps only: `hashicorp/raft`, `hashicorp/raft-boltdb/v2`,
-  `go.etcd.io/bbolt`, `golang.org/x/crypto`. **Don't add dependencies casually** —
-  the embedded web console (`internal/ui`) is deliberately dependency-free vanilla
-  JS/HTML served via `go:embed`. Keep it that way.
+- Standard library + a short dep list: `hashicorp/raft`, `hashicorp/raft-boltdb/v2`,
+  `go.etcd.io/bbolt`, `golang.org/x/crypto`, and `digitorus/timestamp` (RFC 3161
+  audit anchoring, behind the off-by-default `-audit-tsa` flag; pulls in
+  `digitorus/pkcs7` indirectly). **Don't add dependencies casually** — the embedded
+  web console (`internal/ui`) is deliberately dependency-free vanilla JS/HTML served
+  via `go:embed`. Keep it that way.
 
 ## Architecture
 
@@ -66,7 +68,7 @@ replica derives an identical history. Don't compute replicated state outside the
 | `internal/store`   | bbolt-backed encrypted KV; KEK→DEK envelope; versions (`MaxVersions`=10); snapshot export/import |
 | `internal/cluster` | Raft FSM + node lifecycle (bootstrap, join, leader-forwarding, sealed witness), `ClusterStatus` |
 | `internal/server`  | HTTP/JSON API; auth (bearer tokens + path-prefix ACLs); writes forwarded to leader |
-| `internal/audit`   | per-node, append-only, **hash-chained** audit log in its own `audit.db` |
+| `internal/audit`   | per-node, append-only, **hash-chained + Ed25519-signed** audit log in its own `audit.db` (signing key at `audit.key`) |
 | `internal/pki`     | stash-as-CA: issues node leaf certs for inter-node mTLS (CA travels in the join token) |
 | `internal/agent`   | `stash agent`: render secrets to a file (template or `-auto`) with a last-good cache |
 | `internal/ui`      | embedded web console (dependency-free), served at `/` |
