@@ -5,9 +5,9 @@ secret storage that is genuinely *easy* to stand up — no external database, no
 Redis, no Kubernetes. One Go binary that does it all, replicating state with
 embedded Raft.
 
-> **Status: milestone 2 — HA via embedded Raft.** This is a hobby project and is
-> **not production-ready**. Do not trust it with real secrets yet. (For the
-> keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
+> **Status: milestone 3 — easy join (token pairing).** This is a hobby project
+> and is **not production-ready**. Do not trust it with real secrets yet. (For
+> the keygrip dev pair, SOPS stays authoritative until this is battle-tested.)
 
 ## Why
 
@@ -86,30 +86,37 @@ curl -s localhost:8200/v1/secret/kg/web/SECRET_KEY    # {"value":"s3cr3t"}
 curl -s localhost:8200/v1/health                      # {"is_leader":true,"sealed":false,...}
 ```
 
-### Three-node HA cluster
+### Three-node HA cluster — token pairing (no IPs to type)
 
 ```sh
-./stash init -unseal-key-out key     # one key, shared by all real (non-witness) nodes
+# node 1 — bootstrap. Prints a join token (and a warning).
+./stash init -unseal-key-out key
+./stash server -unseal-key key -bootstrap
+  → To add a node, run on the new box:
+        stash join stash1.eyJjaWQiOi…
 
-# node 1 — bootstrap
-./stash server -data /data -unseal-key key -node-id n1 \
-    -listen 0.0.0.0:8200 -raft-addr 10.0.0.1:8300 \
-    -advertise-http http://10.0.0.1:8200 -bootstrap
+# node 2 — paste the token. Address is auto-detected.
+./stash join stash1.eyJjaWQiOi…
 
-# node 2 — join
-./stash server -data /data -unseal-key key -node-id n2 \
-    -listen 0.0.0.0:8200 -raft-addr 10.0.0.2:8300 \
-    -advertise-http http://10.0.0.2:8200 -join http://10.0.0.1:8200
-
-# witness — join WITHOUT a key (sealed quorum voter)
-./stash server -data /data -node-id w \
-    -raft-addr 10.0.0.3:8300 -advertise-http http://10.0.0.3:8200 \
-    -listen 0.0.0.0:8200 -join http://10.0.0.1:8200
+# witness — keyless token => sealed quorum voter (replicates ciphertext, can't read)
+./stash join stash1.eyJjaWQiOi… --no-key
+#   or mint a dedicated keyless token elsewhere:  stash token --no-key
 ```
 
+A new node self-detects the address peers will reach it at (by checking the
+route to the leader), so you don't type IPs or ports. On the same host (demo),
+pass `-listen`/`-raft-port` to avoid collisions; across real boxes the defaults
+are fine. Restarting a node is just `stash server -data DIR -unseal-key key` —
+it recovers its identity/addresses from `cluster.json`.
+
+**The join token carries the unseal key by default** so it's a single value to
+move. That makes the token as sensitive as the master key — prefer your tailnet,
+don't paste it into shared logs, and use `--no-key` for witnesses or any posture
+where the KEK should stay in SOPS. On join the key is written to a local `0600`
+file so restart/self-heal still works.
+
 In production the unseal key is the only thing you keep in SOPS, decrypted to
-tmpfs at deploy and passed via `-unseal-key`. That's the entire residual SOPS
-surface.
+tmpfs at deploy. That's the entire residual SOPS surface.
 
 ## API
 
@@ -120,24 +127,32 @@ surface.
 | `GET`    | `/v1/secret/<path>`  | — | `{"value":"..."}` |
 | `PUT`    | `/v1/secret/<path>`  | `{"value":"..."}` | `204` (forwarded to leader) |
 | `DELETE` | `/v1/secret/<path>`  | — | `204` (forwarded to leader) |
-| `POST`   | `/v1/cluster/join`   | `{"node_id","raft_addr","http_addr"}` | `200` |
+| `POST`   | `/v1/cluster/join`   | `{"node_id","raft_addr","http_addr","secret"}` | `200` (secret-gated) |
 
 `<path>` may contain slashes (`kg/web/SECRET_KEY`).
 
 ## Roadmap
 
+UI is pulled forward deliberately — the friendly UI is the whole differentiator,
+and each later milestone now *feeds* it (audit view, history/diff, login).
+
 - [x] **M1 — single encrypted node**: bbolt + envelope encryption + auto-unseal, HTTP API.
-- [x] **M2 — HA**: embedded `hashicorp/raft` (voters + sealed witness), leader-forwarding, join/bootstrap.
-- [ ] **M3 — identity & access**: machine-identity tokens (hashed at rest) + path-prefix ACLs.
-- [ ] **M4 — audit**: hash-chained append-only audit log (reads + writes), ship to Loki.
-- [ ] **M5 — versioning**: keep last N versions per path; list/diff.
-- [ ] **M6 — agent**: `stash agent` renders secrets → tmpfs with last-good cache (reboot-during-outage self-heal).
-- [ ] **M7 — UI**: small embedded web UI (the real DX win).
+- [x] **M2 — HA**: embedded `hashicorp/raft` (voters + sealed witness), leader-forwarding, bootstrap.
+- [x] **M3 — easy join**: one-token pairing, auto address-detection, secret-gated join, restart from `cluster.json`.
+- [ ] **M4 — Web UI v1**: embedded UI (tailnet-gated via Tailscale Serve) — view/add/edit/delete secrets, cluster health.
+- [ ] **M5 — identity & access**: machine-identity tokens (hashed at rest) + path-prefix ACLs; UI gains login.
+- [ ] **M6 — audit**: hash-chained append-only audit log (reads + writes) → Loki; UI gains an audit view.
+- [ ] **M7 — versioning**: keep last N versions per path; UI gains history/diff.
+- [ ] **M8 — agent**: `stash agent` renders secrets → tmpfs with last-good cache (reboot-during-outage self-heal).
+- [ ] follow-ups: join-secret rotation (`stash token rotate`), inter-node mTLS (CA fingerprint in token), Tailscale auto-discovery.
 
 ## Security notes (read before trusting it)
 
 - Crypto uses only Go stdlib + `x/crypto` AEAD primitives — nothing hand-rolled.
-- The unseal key is never persisted by the daemon and never enters the Raft log.
+- The unseal key never enters the Raft log. A keyed join token *does* carry it
+  (by design, for one-value setup) — so the token is crown-jewel sensitive;
+  `--no-key` avoids it. Join is gated by a per-cluster secret (constant-time
+  compared), but that secret is currently long-lived — rotation is a follow-up.
 - Transport between nodes (Raft + the HTTP API) is currently **unencrypted** —
   run it over a private network / tailnet. mTLS is future work.
 - This has **not** been audited. Treat M1–M5 as a learning build.

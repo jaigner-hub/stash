@@ -18,11 +18,12 @@ type fakeBackend struct {
 	data      map[string][]byte
 	leader    bool
 	leaderURL string
+	secret    string
 	joined    *struct{ id, raft, http string }
 }
 
 func newFake() *fakeBackend {
-	return &fakeBackend{data: map[string][]byte{}, leader: true}
+	return &fakeBackend{data: map[string][]byte{}, leader: true, secret: "good-secret"}
 }
 
 func (f *fakeBackend) Get(p string) ([]byte, error) {
@@ -71,6 +72,7 @@ func (f *fakeBackend) Join(id, raftAddr, httpAddr string) error {
 	f.joined = &struct{ id, raft, http string }{id, raftAddr, httpAddr}
 	return nil
 }
+func (f *fakeBackend) VerifyJoinSecret(s string) bool { return s == f.secret }
 
 func do(t *testing.T, h http.Handler, method, target string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
@@ -198,11 +200,26 @@ func TestJoin(t *testing.T) {
 	h := New(b, nil)
 	body, _ := json.Marshal(map[string]string{
 		"node_id": "n2", "raft_addr": "127.0.0.1:8301", "http_addr": "http://127.0.0.1:8201",
+		"secret": "good-secret",
 	})
 	if rec := do(t, h, "POST", "/v1/cluster/join", body); rec.Code != http.StatusOK {
 		t.Fatalf("got %d (%s)", rec.Code, rec.Body)
 	}
 	if b.joined == nil || b.joined.id != "n2" || b.joined.raft != "127.0.0.1:8301" {
 		t.Fatalf("join not recorded correctly: %+v", b.joined)
+	}
+}
+
+func TestJoinWrongSecret(t *testing.T) {
+	b := newFake()
+	h := New(b, nil)
+	body, _ := json.Marshal(map[string]string{
+		"node_id": "n2", "raft_addr": "127.0.0.1:8301", "secret": "WRONG",
+	})
+	if rec := do(t, h, "POST", "/v1/cluster/join", body); rec.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d", rec.Code)
+	}
+	if b.joined != nil {
+		t.Fatal("join should not have been recorded with a bad secret")
 	}
 }

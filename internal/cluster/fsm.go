@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ const (
 	opPut    cmdOp = "put"    // store a pre-encrypted value blob
 	opDelete cmdOp = "delete" // remove a path
 	opMeta   cmdOp = "meta"   // record a node's API address
+	opConfig cmdOp = "config" // set cluster id + join secret
 )
 
 // command is one entry in the Raft log. Encryption happens once on the leader;
@@ -31,6 +33,8 @@ type command struct {
 	Canary     []byte `json:"canary,omitempty"`
 	NodeID     string `json:"node_id,omitempty"`
 	HTTPAddr   string `json:"http_addr,omitempty"`
+	ClusterID  string `json:"cluster_id,omitempty"`
+	Secret     string `json:"secret,omitempty"`
 }
 
 // fsm is the Raft finite state machine: it applies committed commands to the
@@ -39,8 +43,10 @@ type command struct {
 type fsm struct {
 	store *store.Store
 
-	mu   sync.RWMutex
-	meta map[string]string // nodeID -> advertised HTTP addr
+	mu         sync.RWMutex
+	meta       map[string]string // nodeID -> advertised HTTP addr
+	clusterID  string
+	joinSecret string
 }
 
 func newFSM(st *store.Store) *fsm {
@@ -66,6 +72,12 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		f.meta[c.NodeID] = c.HTTPAddr
 		f.mu.Unlock()
 		return nil
+	case opConfig:
+		f.mu.Lock()
+		f.clusterID = c.ClusterID
+		f.joinSecret = c.Secret
+		f.mu.Unlock()
+		return nil
 	default:
 		return fmt.Errorf("stash/cluster: unknown op %q", c.Op)
 	}
@@ -78,11 +90,31 @@ func (f *fsm) httpAddr(nodeID string) (string, bool) {
 	return a, ok
 }
 
+func (f *fsm) clusterConfig() (id, secret string) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.clusterID, f.joinSecret
+}
+
+// verifySecret constant-time compares a presented join secret against the
+// cluster's. Returns false if no secret has been configured yet.
+func (f *fsm) verifySecret(secret string) bool {
+	f.mu.RLock()
+	want := f.joinSecret
+	f.mu.RUnlock()
+	if want == "" || secret == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(secret), []byte(want)) == 1
+}
+
 // snapshotPayload is the serialized FSM state: store contents (ciphertext) plus
 // the node-address map.
 type snapshotPayload struct {
-	Store *store.Snapshot   `json:"store"`
-	Meta  map[string]string `json:"meta"`
+	Store     *store.Snapshot   `json:"store"`
+	Meta      map[string]string `json:"meta"`
+	ClusterID string            `json:"cluster_id"`
+	Secret    string            `json:"secret"`
 }
 
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
@@ -95,9 +127,10 @@ func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 	for k, v := range f.meta {
 		meta[k] = v
 	}
+	payload := snapshotPayload{Store: snap, Meta: meta, ClusterID: f.clusterID, Secret: f.joinSecret}
 	f.mu.RUnlock()
 
-	buf, err := json.Marshal(snapshotPayload{Store: snap, Meta: meta})
+	buf, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +157,8 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 		payload.Meta = map[string]string{}
 	}
 	f.meta = payload.Meta
+	f.clusterID = payload.ClusterID
+	f.joinSecret = payload.Secret
 	f.mu.Unlock()
 	return nil
 }

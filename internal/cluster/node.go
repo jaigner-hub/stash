@@ -30,11 +30,12 @@ const applyTimeout = 10 * time.Second
 
 // Config configures a cluster node.
 type Config struct {
-	NodeID    string // unique stable id for this node
-	RaftAddr  string // host:port the Raft transport binds/advertises
-	HTTPAddr  string // advertised API URL other nodes use to reach this node
-	DataDir   string // directory for raft logs/snapshots (and the store db)
-	Bootstrap bool   // form a new single-node cluster if no state exists
+	NodeID        string // unique stable id for this node
+	RaftAddr      string // host:port the Raft transport binds to
+	RaftAdvertise string // host:port peers dial (defaults to RaftAddr)
+	HTTPAddr      string // advertised API URL other nodes use to reach this node
+	DataDir       string // directory for raft logs/snapshots (and the store db)
+	Bootstrap     bool   // form a new single-node cluster if no state exists
 }
 
 // JoinRequest is the body of POST /v1/cluster/join.
@@ -42,6 +43,7 @@ type JoinRequest struct {
 	NodeID   string `json:"node_id"`
 	RaftAddr string `json:"raft_addr"`
 	HTTPAddr string `json:"http_addr"`
+	Secret   string `json:"secret"`
 }
 
 // Node is a single member of a stash cluster.
@@ -63,9 +65,13 @@ func New(cfg Config, st *store.Store) (*Node, error) {
 	rc := raft.DefaultConfig()
 	rc.LocalID = raft.ServerID(cfg.NodeID)
 
-	tcpAddr, err := net.ResolveTCPAddr("tcp", cfg.RaftAddr)
+	advertise := cfg.RaftAdvertise
+	if advertise == "" {
+		advertise = cfg.RaftAddr
+	}
+	tcpAddr, err := net.ResolveTCPAddr("tcp", advertise)
 	if err != nil {
-		return nil, fmt.Errorf("stash/cluster: resolve raft addr: %w", err)
+		return nil, fmt.Errorf("stash/cluster: resolve raft advertise addr: %w", err)
 	}
 	tn, err := raft.NewTCPTransport(cfg.RaftAddr, tcpAddr, 3, 10*time.Second, os.Stderr)
 	if err != nil {
@@ -202,8 +208,32 @@ func (n *Node) Initialize(kek []byte, timeout time.Duration) error {
 			return err
 		}
 	}
+	// Establish cluster identity + join secret once, replicated to all nodes so
+	// any future leader can authenticate join requests.
+	if id, secret := n.fsm.clusterConfig(); id == "" || secret == "" {
+		id, err := randomHex(8)
+		if err != nil {
+			return err
+		}
+		secret, err := randomHex(32)
+		if err != nil {
+			return err
+		}
+		if err := n.apply(command{Op: opConfig, ClusterID: id, Secret: secret}); err != nil {
+			return err
+		}
+	}
 	return n.apply(command{Op: opMeta, NodeID: n.cfg.NodeID, HTTPAddr: n.cfg.HTTPAddr})
 }
+
+// ClusterConfig returns the cluster id and join secret (once initialized).
+func (n *Node) ClusterConfig() (id, secret string) { return n.fsm.clusterConfig() }
+
+// VerifyJoinSecret reports whether secret matches the cluster's join secret.
+func (n *Node) VerifyJoinSecret(secret string) bool { return n.fsm.verifySecret(secret) }
+
+// AdvertiseHTTP returns this node's advertised API URL.
+func (n *Node) AdvertiseHTTP() string { return n.cfg.HTTPAddr }
 
 // Unseal blocks until the cluster's init material has replicated to this node,
 // then unseals the local store with kek. Use for joiners and restarts.
@@ -271,8 +301,10 @@ func (n *Node) waitLeader(timeout time.Duration) error {
 
 // RequestJoin asks the cluster at leaderURL to admit this node. The contacted
 // node forwards to the leader if needed.
-func RequestJoin(leaderURL, nodeID, raftAddr, httpAddr string) error {
-	body, err := json.Marshal(JoinRequest{NodeID: nodeID, RaftAddr: raftAddr, HTTPAddr: httpAddr})
+func RequestJoin(leaderURL, nodeID, raftAddr, httpAddr, secret string) error {
+	body, err := json.Marshal(JoinRequest{
+		NodeID: nodeID, RaftAddr: raftAddr, HTTPAddr: httpAddr, Secret: secret,
+	})
 	if err != nil {
 		return err
 	}

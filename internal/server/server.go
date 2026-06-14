@@ -29,6 +29,7 @@ type Backend interface {
 	IsLeader() bool
 	LeaderHTTPAddr() (addr string, known bool)
 	Join(nodeID, raftAddr, httpAddr string) error
+	VerifyJoinSecret(secret string) bool
 }
 
 type server struct {
@@ -133,6 +134,10 @@ func (s *server) join(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.NodeID == "" || req.RaftAddr == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_id and raft_addr are required"})
+		return
+	}
+	if !s.backend.VerifyJoinSecret(req.Secret) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid join secret"})
 		return
 	}
 	if err := s.backend.Join(req.NodeID, req.RaftAddr, req.HTTPAddr); err != nil {
