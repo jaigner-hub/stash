@@ -168,6 +168,7 @@ func cmdServer(args []string) error {
 		cfg.RaftAdvertise = net.JoinHostPort(advHost, portOf(*raftAddr))
 		cfg.HTTPAddr = "http://" + net.JoinHostPort(advHost, portOf(listenAddr))
 	}
+	cfg.Witness = kek == nil // restarted witness (no key) must not remain leader
 
 	st, err := store.Open(dbPath(*dir))
 	if err != nil {
@@ -284,6 +285,7 @@ func cmdJoin(args []string) error {
 
 	node, err := cluster.New(cluster.Config{
 		NodeID: id, RaftAddr: raftBind, RaftAdvertise: raftAdv, HTTPAddr: httpAdv, DataDir: *dir,
+		Witness: kek == nil, // no key => witness; must not remain leader
 	}, st)
 	if err != nil {
 		return err

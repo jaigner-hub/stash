@@ -23,6 +23,10 @@ func freeAddr(t *testing.T) string {
 
 // newNode spins up an isolated node and returns it plus its raft and http addrs.
 func newNode(t *testing.T, id string, bootstrap bool) (n *Node, raftAddr, httpAddr string) {
+	return newNodeW(t, id, bootstrap, false)
+}
+
+func newNodeW(t *testing.T, id string, bootstrap, witness bool) (n *Node, raftAddr, httpAddr string) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "stash.db"))
@@ -32,7 +36,8 @@ func newNode(t *testing.T, id string, bootstrap bool) (n *Node, raftAddr, httpAd
 	raftAddr = freeAddr(t)
 	httpAddr = "http://" + freeAddr(t)
 	n, err = New(Config{
-		NodeID: id, RaftAddr: raftAddr, HTTPAddr: httpAddr, DataDir: dir, Bootstrap: bootstrap,
+		NodeID: id, RaftAddr: raftAddr, HTTPAddr: httpAddr, DataDir: dir,
+		Bootstrap: bootstrap, Witness: witness,
 	}, st)
 	if err != nil {
 		t.Fatal(err)
@@ -175,6 +180,44 @@ func TestThreeNodeReplication(t *testing.T) {
 		t.Fatalf("leader http addr: got %q ok=%v want %q", addr, ok, h1)
 	}
 	_ = n3
+}
+
+// TestWitnessYieldsLeadership: with two keyed voters + one witness, killing the
+// keyed leader must result in the OTHER keyed node leading (never the witness),
+// and writes must keep working.
+func TestWitnessYieldsLeadership(t *testing.T) {
+	kek := mustKey(t)
+	n1, _, _ := newNode(t, "n1", true)
+	if _, err := n1.Initialize(kek, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := n1.Unseal(kek, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	n2, r2, h2 := newNode(t, "n2", false)
+	w, rw, hw := newNodeW(t, "w", false, true)
+	if err := n1.Join("n2", r2, h2); err != nil {
+		t.Fatal(err)
+	}
+	if err := n1.Join("w", rw, hw); err != nil {
+		t.Fatal(err)
+	}
+	if err := n2.Unseal(kek, 15*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// Kill the keyed leader n1; quorum survives as n2 + witness.
+	n1.Close()
+
+	// The witness must not end up leader — n2 should.
+	eventually(t, 25*time.Second, func() bool { return n2.IsLeader() })
+	if w.IsLeader() {
+		t.Fatal("witness should never remain leader")
+	}
+	// And the surviving cluster can still serve writes.
+	if err := n2.Put("after", []byte("ok")); err != nil {
+		t.Fatalf("write after failover: %v", err)
+	}
 }
 
 func TestWitnessReplicatesButCannotRead(t *testing.T) {

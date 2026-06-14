@@ -36,6 +36,7 @@ type Config struct {
 	HTTPAddr      string // advertised API URL other nodes use to reach this node
 	DataDir       string // directory for raft logs/snapshots (and the store db)
 	Bootstrap     bool   // form a new single-node cluster if no state exists
+	Witness       bool   // this node has no key; it must never remain leader
 }
 
 // JoinRequest is the body of POST /v1/cluster/join.
@@ -109,10 +110,32 @@ func New(cfg Config, st *store.Store) (*Node, error) {
 			return nil, fmt.Errorf("stash/cluster: bootstrap: %w", err)
 		}
 	}
-	return &Node{
+	n := &Node{
 		cfg: cfg, raft: r, fsm: f, store: st, tn: tn,
 		logStore: logStore, stableStore: stableStore,
-	}, nil
+	}
+	// A witness can't serve writes (no key), so it must not lead. If it wins an
+	// election, hand leadership to a keyed peer.
+	if cfg.Witness {
+		go n.shedLeadership()
+	}
+	return n, nil
+}
+
+// shedLeadership transfers leadership away whenever this (witness) node becomes
+// leader. It exits when Raft shuts down (LeaderCh closes).
+func (n *Node) shedLeadership() {
+	for isLeader := range n.raft.LeaderCh() {
+		if !isLeader {
+			continue
+		}
+		for i := 0; i < 10 && n.raft.State() == raft.Leader; i++ {
+			if err := n.raft.LeadershipTransfer().Error(); err == nil {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 }
 
 // IsLeader reports whether this node is the current Raft leader.
